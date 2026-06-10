@@ -6,6 +6,7 @@ export interface Env {
   AIZPRUA_WIKI_KV: KVNamespace;
   AI: any; // Binding nativo de Cloudflare Workers AI
   WEBHOOK_SECRET?: string; // Secreto para verificar webhooks de GitHub
+  GEMINI_MODEL?: string; // Modelo de Gemini a usar (default: gemini-2.5-flash)
 }
 
 export default {
@@ -278,6 +279,10 @@ export default {
 
     } catch (error: any) {
       console.error("Error en el Handler:", error);
+      try {
+        await alertAdmin(env, "HANDLER_FAIL", error.message || error);
+      } catch (_) {}
+      return new Response("Error interno", { status: 500 });
     }
 
     return new Response("OK", { status: 200 });
@@ -763,10 +768,33 @@ ${kbContext}`;
 }
 
 /**
- * Llama al modelo Gemini 2.5 Flash y devuelve la respuesta como texto.
+ * Llama al modelo Gemini y devuelve la respuesta como texto.
+ * El modelo se configura via env.GEMINI_MODEL o usa gemini-2.0-flash como fallback.
  */
 async function callGemini(env: Env, systemPrompt: string, history: {role: string, text: string}[]): Promise<string> {
-  const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${env.GEMINI_API_KEY}`;
+  const modelsToTry = [
+    env.GEMINI_MODEL,
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash"
+  ].filter(Boolean) as string[];
+
+  let lastError: Error | null = null;
+
+  for (const model of modelsToTry) {
+    try {
+      return await tryGeminiModel(env, model, systemPrompt, history);
+    } catch (err: any) {
+      lastError = err;
+      console.error(`Gemini model ${model} falló:`, err.message || err);
+    }
+  }
+
+  throw lastError || new Error("Todos los modelos de Gemini fallaron");
+}
+
+async function tryGeminiModel(env: Env, model: string, systemPrompt: string, history: {role: string, text: string}[]): Promise<string> {
+  const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${env.GEMINI_API_KEY}`;
   
   const geminiContents = history.map(h => ({
     role: h.role,
@@ -793,7 +821,9 @@ async function callGemini(env: Env, systemPrompt: string, history: {role: string
       if (parsed.error && parsed.error.message) {
         cleanMsg = parsed.error.message;
       }
-    } catch (e) {}
+    } catch (e) {
+      console.error("Error al parsear respuesta de error de Gemini:", e);
+    }
     throw new Error(`Código ${geminiRes.status}: ${cleanMsg}`);
   }
 
@@ -944,9 +974,10 @@ async function runSystemDiagnostics(env: Env): Promise<string> {
   report += `🐙 *GitHub API:* ${githubStatus}\n`;
 
   // 3. Validar Gemini API
+  const geminiModel = env.GEMINI_MODEL || "gemini-2.5-flash";
   let geminiStatus = "✅ Respondiendo";
   try {
-    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${env.GEMINI_API_KEY}`;
+    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=${env.GEMINI_API_KEY}`;
     const res = await fetch(geminiUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -961,7 +992,7 @@ async function runSystemDiagnostics(env: Env): Promise<string> {
     geminiStatus = `❌ Error (${err.message || err})`;
     overallStatus = "⚠️ Atención requerida";
   }
-  report += `🤖 *Gemini 2.5 Flash:* ${geminiStatus}\n`;
+  report += `🤖 *Gemini (${geminiModel}):* ${geminiStatus}\n`;
 
   // 4. Validar Llama 3.1 Backup
   let llamaStatus = "✅ Respondiendo";
