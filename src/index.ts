@@ -534,47 +534,45 @@ async function getRelevantContext(env: Env, query: string, docKeys: string[]): P
     return getRelevantContextKeywordFallback(env, query, docKeys);
   }
 
+  // Solo usar embeddings ya cacheados (no generar en caliente)
   const similarities: { key: string; similarity: number }[] = [];
+  const missingEmbeds: string[] = [];
 
-  for (const key of docKeys) {
+  const embResults = await Promise.all(docKeys.map(async (key) => {
     try {
-      let embStr = await env.AIZPRUA_WIKI_KV.get(`embedding:${key}`);
+      const embStr = await env.AIZPRUA_WIKI_KV.get(`embedding:${key}`);
+      return { key, embStr };
+    } catch {
+      return { key, embStr: null };
+    }
+  }));
 
-      // Si no hay embedding cacheado, descargar contenido, generarlo y guardarlo
-      if (!embStr) {
-        const content = await getFileContent(env, key);
-        if (content) {
-          const embedding = await generateEmbedding(env, content);
-          if (embedding) {
-            embStr = JSON.stringify(embedding);
-            await env.AIZPRUA_WIKI_KV.put(`embedding:${key}`, embStr);
-          }
-        }
-      }
-
-      if (embStr) {
+  for (const { key, embStr } of embResults) {
+    if (embStr) {
+      try {
         const vector = JSON.parse(embStr);
         if (Array.isArray(vector) && vector.length > 0) {
           const sim = cosineSimilarity(queryVector, vector);
           similarities.push({ key, similarity: sim });
         }
+      } catch {
+        missingEmbeds.push(key);
       }
-    } catch (err) {
-      console.error(`Error calculando similitud para ${key}:`, err);
+    } else {
+      missingEmbeds.push(key);
     }
   }
 
   // Ordenar de mayor a menor similitud
   similarities.sort((a, b) => b.similarity - a.similarity);
 
-  // Seleccionar los mejores 8 documentos (antes eran 3)
+  // Seleccionar los mejores 8 documentos
   const topDocs = similarities.slice(0, 8);
 
   let context = "";
   let filesIncluded = 0;
 
   for (const item of topDocs) {
-    // Aceptamos documentos con similitud mínima de 0.25 (antes era 0.35)
     if (item.similarity > 0.25) {
       const fileContent = await getFileContent(env, item.key);
       if (fileContent) {
@@ -585,9 +583,32 @@ async function getRelevantContext(env: Env, query: string, docKeys: string[]): P
     }
   }
 
-  // Si no se incluyeron documentos con buena afinidad semántica, caemos a búsqueda clásica por palabras clave
+  // Si no hay suficientes con buena similitud semántica, caer a búsqueda por palabras clave
   if (filesIncluded === 0) {
     return getRelevantContextKeywordFallback(env, query, docKeys);
+  }
+
+  // Generar embeddings en caliente para documentos sin embedding (solo los que tienen keywords coincidentes)
+  // pero en lotes pequeños para no exceder CPU
+  if (missingEmbeds.length > 0) {
+    const usedKeys = new Set(topDocs.map(d => d.key));
+    const unusedMissing = missingEmbeds.filter(k => !usedKeys.has(k));
+    if (unusedMissing.length > 0) {
+      try {
+        const batch = unusedMissing.slice(0, 5);
+        for (const key of batch) {
+          const content = await getFileContent(env, key);
+          if (content) {
+            const embedding = await generateEmbedding(env, content);
+            if (embedding) {
+              await env.AIZPRUA_WIKI_KV.put(`embedding:${key}`, JSON.stringify(embedding));
+            }
+          }
+        }
+      } catch (err) {
+        console.error("Error al generar embeddings post-respuesta:", err);
+      }
+    }
   }
 
   return context;
@@ -1191,7 +1212,8 @@ function cosineSimilarity(vecA: number[], vecB: number[]): number {
 }
 
 /**
- * Búsqueda clásica por palabras clave (fallback cuando falla embeddings o no hay coincidencias semánticas).
+ * Búsqueda clásica por palabras clave (fallback cuando no hay embeddings cacheados o suficientes coincidencias).
+ * Optimizada para no descargar contenido de todos los archivos — primero filtra por nombre.
  */
 async function getRelevantContextKeywordFallback(env: Env, query: string, docKeys: string[]): Promise<string> {
   const stopWords = new Set(["el", "la", "los", "las", "un", "una", "unos", "unas", "de", "del", "y", "o", "e", "u", "a", "en", "para", "por", "con", "sin", "sobre", "que", "es", "son", "se", "lo", "como", "cual", "cuales", "donde", "cuando", "quien", "cuanto", "cuantos"]);
@@ -1201,37 +1223,49 @@ async function getRelevantContextKeywordFallback(env: Env, query: string, docKey
     .split(/\s+/)
     .filter(word => word.length > 2 && !stopWords.has(word));
 
-  let context = "";
-  let filesIncluded = 0;
+  // Fase 1: filtrar por nombre de archivo (sin descargar contenido)
+  const nameMatched = docKeys.filter(key =>
+    key.endsWith("index.md") || keywords.some(kw => key.toLowerCase().includes(kw))
+  );
 
-  for (const key of docKeys) {
-    const fileContent = await getFileContent(env, key);
-    if (!fileContent) continue;
-
-    const contentLower = fileContent.toLowerCase();
-    const fileNameLower = key.toLowerCase();
-
-    const isMatch = keywords.some(keyword => fileNameLower.includes(keyword) || contentLower.includes(keyword));
-    const isIndex = key.endsWith("index.md");
-
-    if (isMatch || isIndex) {
-      const fileNameClean = key.split('/').pop()?.replace('.md', '') || key;
-      context += `\n--- Tema/Documento: ${fileNameClean} ---\n${fileContent}\n`;
-      filesIncluded++;
-    }
+  // Fase 2: descargar contenido solo de los archivos que coinciden por nombre (en paralelo)
+  let matchedDocs: { key: string; content: string }[] = [];
+  if (nameMatched.length > 0) {
+    const results = await Promise.all(nameMatched.map(async (key) => {
+      const content = await getFileContent(env, key);
+      return { key, content: content || "" };
+    }));
+    matchedDocs = results.filter(r => r.content);
   }
 
-  // Si no coincide casi nada, incluimos por defecto los primeros 8 documentos
-  if (filesIncluded <= 1) {
-    context = "";
-    const limit = Math.min(docKeys.length, 8);
-    for (let i = 0; i < limit; i++) {
-      const key = docKeys[i];
-      const fileContent = await getFileContent(env, key);
-      if (fileContent) {
-        const fileNameClean = key.split('/').pop()?.replace('.md', '') || key;
-        context += `\n--- Tema/Documento: ${fileNameClean} ---\n${fileContent}\n`;
-      }
+  // Fase 3: verificar también coincidencias en el contenido
+  const contentMatched = matchedDocs.filter(({ key, content }) => {
+    if (key.endsWith("index.md")) return true;
+    const fileNameLower = key.toLowerCase();
+    if (keywords.some(kw => fileNameLower.includes(kw))) return true;
+    return keywords.some(kw => content.toLowerCase().includes(kw));
+  });
+
+  let context = "";
+  if (contentMatched.length > 1) {
+    for (const { key, content } of contentMatched) {
+      const fileNameClean = key.split('/').pop()?.replace('.md', '') || key;
+      context += `\n--- Tema/Documento: ${fileNameClean} ---\n${content}\n`;
+    }
+    return context;
+  }
+
+  // Fase 4: si no hay suficientes coincidencias, incluir los primeros 8 docs en paralelo
+  const limit = Math.min(docKeys.length, 8);
+  const defaultDocs = await Promise.all(docKeys.slice(0, limit).map(async (key) => {
+    const content = await getFileContent(env, key);
+    return { key, content: content || "" };
+  }));
+
+  for (const { key, content } of defaultDocs) {
+    if (content) {
+      const fileNameClean = key.split('/').pop()?.replace('.md', '') || key;
+      context += `\n--- Tema/Documento: ${fileNameClean} ---\n${content}\n`;
     }
   }
 
