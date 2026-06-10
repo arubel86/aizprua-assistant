@@ -333,124 +333,97 @@ async function sendSingleTelegramMessage(env: Env, chatId: number, text: string)
 }
 
 /**
- * Descarga y sincroniza la wiki de GitHub guardando los archivos Markdown en Cloudflare KV.
+ * Obtiene el contenido de un archivo .md desde GitHub (con cache en KV).
+ */
+async function getFileContent(env: Env, path: string): Promise<string | null> {
+  // Intentar desde cache KV primero
+  const cached = await env.AIZPRUA_WIKI_KV.get(path);
+  if (cached !== null) return cached;
+
+  // Descargar desde GitHub y cachear
+  const url = `https://raw.githubusercontent.com/arubel86/Aizpruase-Documentos-Tramites/main/${encodeURIComponent(path)}`;
+  const res = await fetch(url, {
+    headers: {
+      "Authorization": `token ${env.GITHUB_TOKEN}`,
+      "User-Agent": "Cloudflare-Worker-Telegram-Bot"
+    }
+  });
+
+  if (!res.ok) return null;
+
+  const content = await res.text();
+  // Cachear con expiración de 7 días (604800s) para no saturar KV
+  await env.AIZPRUA_WIKI_KV.put(path, content, { expirationTtl: 604800 });
+  return content;
+}
+
+/**
+ * Sincroniza la lista de archivos .md desde GitHub usando Git Trees API (1 sola llamada).
+ * No descarga contenidos ni genera embeddings — eso se hace bajo demanda en las consultas.
  */
 async function syncGitHubWiki(env: Env, chatId: number): Promise<void> {
-  let filesSyncedCount = 0;
-  const filesList: { name: string; path: string; download_url: string }[] = [];
-
-  // Helper interno recursivo para explorar carpetas de GitHub con paginación
-  async function traverse(path: string) {
-    let page = 1;
-    let hasMore = true;
-
-    while (hasMore) {
-      const url = `https://api.github.com/repos/arubel86/Aizpruase-Documentos-Tramites/contents/${encodeURIComponent(path)}?per_page=100&page=${page}`;
-      const response = await fetch(url, {
-        headers: {
-          "Authorization": `token ${env.GITHUB_TOKEN}`,
-          "User-Agent": "Cloudflare-Worker-Telegram-Bot",
-          "Accept": "application/vnd.github.v3+json"
-        }
-      });
-
-      if (!response.ok) {
-        if (response.status === 404) return;
-        throw new Error(`Error al leer GitHub: ${path} (Status ${response.status})`);
-      }
-
-      const items = await response.json() as any[];
-      if (items.length === 0) { hasMore = false; break; }
-
-      for (const item of items) {
-        // Ignorar archivos y carpetas ocultas/de configuración (.agents, .git, etc.)
-        if (item.name.startsWith('.')) continue;
-
-        // Ignorar carpetas de herramientas, scripts o proyectos de código
-        if (
-          item.path.includes('Video-Project') ||
-          item.path.includes('Calculadora') ||
-          item.path.includes('talnect-brain') ||
-          item.path.includes('6. Herramientas')
-        ) {
-          continue;
-        }
-
-        if (item.type === 'dir') {
-          await traverse(item.path);
-        } else if (item.type === 'file' && item.name.endsWith('.md')) {
-          filesList.push({
-            name: item.name,
-            path: item.path,
-            download_url: item.download_url
-          });
-        }
-      }
-
-      // Si GitHub devolvió menos de 100 items, es la última página
-      if (items.length < 100) { hasMore = false; }
-      page++;
+  // 1. Obtener SHA de la branch main
+  const refRes = await fetch("https://api.github.com/repos/arubel86/Aizpruase-Documentos-Tramites/git/refs/heads/main", {
+    headers: {
+      "Authorization": `token ${env.GITHUB_TOKEN}`,
+      "User-Agent": "Cloudflare-Worker-Telegram-Bot",
+      "Accept": "application/vnd.github.v3+json"
     }
+  });
+
+  if (!refRes.ok) {
+    throw new Error(`Error al obtener refs: ${refRes.status}`);
   }
 
-  // Iniciar la exploración desde la raíz del repositorio
-  await traverse("");
+  const refData = await refRes.json() as any;
+  const treeSha = refData.object.sha;
 
-  // Mantener registro de las claves sincronizadas para borrar archivos obsoletos de KV
-  const syncedKeys: string[] = [];
+  // 2. Obtener el árbol completo recursivo (1 sola llamada)
+  const treeRes = await fetch(`https://api.github.com/repos/arubel86/Aizpruase-Documentos-Tramites/git/trees/${treeSha}?recursive=1`, {
+    headers: {
+      "Authorization": `token ${env.GITHUB_TOKEN}`,
+      "User-Agent": "Cloudflare-Worker-Telegram-Bot",
+      "Accept": "application/vnd.github.v3+json"
+    }
+  });
 
-  // Procesar archivos en lotes paralelos de 5 para acelerar
-  const BATCH_SIZE = 5;
-  for (let i = 0; i < filesList.length; i += BATCH_SIZE) {
-    const batch = filesList.slice(i, i + BATCH_SIZE);
-    await Promise.all(batch.map(async (file) => {
-      try {
-        const fileRes = await fetch(file.download_url, {
-          headers: {
-            "Authorization": `token ${env.GITHUB_TOKEN}`,
-            "User-Agent": "Cloudflare-Worker-Telegram-Bot"
-          }
-        });
-
-        if (!fileRes.ok) return;
-
-        const content = await fileRes.text();
-        await env.AIZPRUA_WIKI_KV.put(file.path, content);
-        syncedKeys.push(file.path);
-
-        filesSyncedCount++;
-      } catch (fileErr) {
-        console.error(`Error al procesar ${file.path}:`, fileErr);
-      }
-    }));
+  if (!treeRes.ok) {
+    throw new Error(`Error al obtener árbol: ${treeRes.status}`);
   }
 
-  // Eliminar documentos .md antiguos que ya no existan en el repositorio
-  // (los embeddings se regeneran bajo demanda, no se borran)
-  let cleanedCount = 0;
-  try {
-    const syncedSet = new Set(syncedKeys);
-    let cursor: string | undefined;
-    do {
-      const list = await env.AIZPRUA_WIKI_KV.list({ cursor });
-      for (const key of list.keys) {
-        if (key.name.endsWith(".md") && !syncedSet.has(key.name)) {
-          // Borrar el documento y su embedding asociado
-          await env.AIZPRUA_WIKI_KV.delete(key.name);
-          await env.AIZPRUA_WIKI_KV.delete(`embedding:${key.name}`).catch(() => {});
-          cleanedCount++;
-        }
-      }
-      cursor = list.list_complete ? undefined : list.cursor;
-    } while (cursor);
-  } catch (cleanErr) {
-    console.error("Error al limpiar claves antiguas en KV:", cleanErr);
+  const treeData = await treeRes.json() as any;
+
+  // 3. Filtrar solo archivos .md, ignorando ocultos y excluidos
+  const filesList: string[] = [];
+
+  for (const item of treeData.tree) {
+    if (item.type !== "blob") continue;
+    if (!item.path.endsWith(".md")) continue;
+
+    // Ignorar archivos y carpetas ocultas
+    const parts = item.path.replace(/\\/g, '/').split('/');
+    if (parts.some((p: string) => p.startsWith('.'))) continue;
+
+    // Ignorar carpetas de herramientas, scripts o proyectos de código
+    if (
+      item.path.includes('Video-Project') ||
+      item.path.includes('Calculadora') ||
+      item.path.includes('talnect-brain') ||
+      item.path.includes('6. Herramientas')
+    ) {
+      continue;
+    }
+
+    filesList.push(item.path);
   }
+
+  // 4. Guardar la lista de archivos en KV
+  await env.AIZPRUA_WIKI_KV.put("_file_list", JSON.stringify(filesList));
 
   await sendTelegramMessage(
     env,
     chatId,
-    `✅ *Sincronización completada* 📚\n━━━━━━━━━━━━━━━━━━━━━━\n📄 Documentos encontrados en GitHub: ${filesList.length}\n💾 Guardados en KV: ${filesSyncedCount}\n🧠 Embeddings generados: ${filesSyncedCount}${cleanedCount > 0 ? `\n🗑️ Documentos antiguos eliminados: ${cleanedCount}` : ""}\n━━━━━━━━━━━━━━━━━━━━━━\nLa base de conocimiento está actualizada y lista para consultas.`
+    `✅ *Sincronización completada* 📚\n━━━━━━━━━━━━━━━━━━━━━━\n📄 Archivos .md encontrados en GitHub: ${filesList.length}\n📋 Lista guardada en KV\n━━━━━━━━━━━━━━━━━━━━━━\nLos contenidos se descargan bajo demanda cuando haces consultas.`
   );
 }
 
@@ -566,10 +539,10 @@ async function getRelevantContext(env: Env, query: string, docKeys: string[]): P
   for (const key of docKeys) {
     try {
       let embStr = await env.AIZPRUA_WIKI_KV.get(`embedding:${key}`);
-      
-      // Si no hay embedding cacheado, generarlo bajo demanda y guardarlo
+
+      // Si no hay embedding cacheado, descargar contenido, generarlo y guardarlo
       if (!embStr) {
-        const content = await env.AIZPRUA_WIKI_KV.get(key);
+        const content = await getFileContent(env, key);
         if (content) {
           const embedding = await generateEmbedding(env, content);
           if (embedding) {
@@ -596,14 +569,14 @@ async function getRelevantContext(env: Env, query: string, docKeys: string[]): P
 
   // Seleccionar los mejores 8 documentos (antes eran 3)
   const topDocs = similarities.slice(0, 8);
-  
+
   let context = "";
   let filesIncluded = 0;
 
   for (const item of topDocs) {
     // Aceptamos documentos con similitud mínima de 0.25 (antes era 0.35)
     if (item.similarity > 0.25) {
-      const fileContent = await env.AIZPRUA_WIKI_KV.get(item.key);
+      const fileContent = await getFileContent(env, item.key);
       if (fileContent) {
         const fileNameClean = item.key.split('/').pop()?.replace('.md', '') || item.key;
         context += `\n--- Tema/Documento: ${fileNameClean} (Similitud: ${(item.similarity * 100).toFixed(1)}%) ---\n${fileContent}\n`;
@@ -668,23 +641,18 @@ async function saveChatHistory(env: Env, chatId: number, history: {role: "user" 
 async function handleUserQuery(env: Env, chatId: number, query: string): Promise<void> {
   await sendTelegramTyping(env, chatId);
 
-  // 1. Listar solo documentos .md en KV (con paginación para evitar límite de 1000)
-  let allDocKeys: string[] = [];
-  let cursor: string | undefined;
-  do {
-    const result = await env.AIZPRUA_WIKI_KV.list({ cursor, prefix: "" });
-    allDocKeys.push(...result.keys.filter(k => k.name.endsWith(".md") && !k.name.startsWith("embedding:")).map(k => k.name));
-    cursor = result.list_complete ? undefined : result.cursor;
-  } while (cursor);
-
-  if (allDocKeys.length === 0) {
+  // 1. Leer lista de archivos desde _file_list (generada por /sync)
+  const fileListStr = await env.AIZPRUA_WIKI_KV.get("_file_list");
+  if (!fileListStr) {
     await sendTelegramMessage(
       env, 
       chatId, 
-      "La base de conocimiento está vacía. Por favor, pídele al administrador que ejecute `/sync` para cargar los datos."
+      "La base de conocimiento no ha sido sincronizada aún. Por favor, pídele al administrador que ejecute `/sync`."
     );
     return;
   }
+
+  const allDocKeys: string[] = JSON.parse(fileListStr);
 
   // 2. Obtener contexto optimizado y filtrado
   const kbContext = await getRelevantContext(env, query, allDocKeys);
@@ -1117,11 +1085,11 @@ async function runSystemDiagnostics(env: Env): Promise<string> {
 
   // 5. Contar documentos
   try {
-    const list = await env.AIZPRUA_WIKI_KV.list();
-    const docCount = list.keys.filter(k => k.name.endsWith(".md") && !k.name.startsWith("embedding:")).length;
-    report += `📚 *Base de Conocimiento:* ${docCount} documentos cargados\n`;
+    const fileListStr = await env.AIZPRUA_WIKI_KV.get("_file_list");
+    const docCount = fileListStr ? (JSON.parse(fileListStr) as string[]).length : 0;
+    report += `📚 *Base de Conocimiento:* ${docCount} archivos .md registrados\n`;
   } catch (err: any) {
-    report += `📚 *Base de Conocimiento:* Error al listar\n`;
+    report += `📚 *Base de Conocimiento:* Error al leer\n`;
   }
 
   report += `━━━━━━━━━━━━━━━━━━━━━━\n`;
@@ -1227,7 +1195,7 @@ function cosineSimilarity(vecA: number[], vecB: number[]): number {
  */
 async function getRelevantContextKeywordFallback(env: Env, query: string, docKeys: string[]): Promise<string> {
   const stopWords = new Set(["el", "la", "los", "las", "un", "una", "unos", "unas", "de", "del", "y", "o", "e", "u", "a", "en", "para", "por", "con", "sin", "sobre", "que", "es", "son", "se", "lo", "como", "cual", "cuales", "donde", "cuando", "quien", "cuanto", "cuantos"]);
-  
+
   const keywords = query.toLowerCase()
     .replace(/[¿?¡!.,;:#()]/g, "")
     .split(/\s+/)
@@ -1237,12 +1205,12 @@ async function getRelevantContextKeywordFallback(env: Env, query: string, docKey
   let filesIncluded = 0;
 
   for (const key of docKeys) {
-    const fileContent = await env.AIZPRUA_WIKI_KV.get(key);
+    const fileContent = await getFileContent(env, key);
     if (!fileContent) continue;
 
     const contentLower = fileContent.toLowerCase();
     const fileNameLower = key.toLowerCase();
-    
+
     const isMatch = keywords.some(keyword => fileNameLower.includes(keyword) || contentLower.includes(keyword));
     const isIndex = key.endsWith("index.md");
 
@@ -1259,7 +1227,7 @@ async function getRelevantContextKeywordFallback(env: Env, query: string, docKey
     const limit = Math.min(docKeys.length, 8);
     for (let i = 0; i < limit; i++) {
       const key = docKeys[i];
-      const fileContent = await env.AIZPRUA_WIKI_KV.get(key);
+      const fileContent = await getFileContent(env, key);
       if (fileContent) {
         const fileNameClean = key.split('/').pop()?.replace('.md', '') || key;
         context += `\n--- Tema/Documento: ${fileNameClean} ---\n${fileContent}\n`;
