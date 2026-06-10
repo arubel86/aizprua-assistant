@@ -92,21 +92,23 @@ export default {
         return new Response("OK", { status: 200 });
       }
 
-      // Comando de sincronización (solo admin)
+      // Comando de sincronización (solo admin, se ejecuta en segundo plano)
       if (text === "/sync") {
         if (!isAdmin) {
           await sendTelegramMessage(env, chatId, "Lo siento, no tienes permisos de administrador para sincronizar la base de conocimiento. ❌");
           return new Response("OK", { status: 200 });
         }
 
-        await sendTelegramMessage(env, chatId, "Sincronizando la base de conocimiento desde GitHub... ⏳");
-        try {
-          await syncGitHubWiki(env, chatId);
-        } catch (err: any) {
-          const errMsg = err.message || err;
-          await sendTelegramMessage(env, chatId, `Error durante la sincronización: ${errMsg} ❌`);
-          ctx.waitUntil(alertAdmin(env, "SYNC_FAIL", errMsg));
-        }
+        await sendTelegramMessage(env, chatId, "🔄 *Sincronización iniciada en segundo plano*\n\nEl proceso puede tomar varios minutos. Te notificaré cuando termine. ⏳");
+        ctx.waitUntil((async () => {
+          try {
+            await syncGitHubWiki(env, chatId);
+          } catch (err: any) {
+            const errMsg = err.message || err;
+            await sendTelegramMessage(env, chatId, `Error durante la sincronización: ${errMsg} ❌`);
+            await alertAdmin(env, "SYNC_FAIL", errMsg);
+          }
+        })());
         return new Response("OK", { status: 200 });
       }
 
@@ -397,33 +399,40 @@ async function syncGitHubWiki(env: Env, chatId: number): Promise<void> {
   // Mantener registro de las claves sincronizadas para borrar archivos obsoletos de KV
   const syncedKeys: string[] = [];
 
-  for (const file of filesList) {
-    const fileRes = await fetch(file.download_url, {
-      headers: {
-        "Authorization": `token ${env.GITHUB_TOKEN}`,
-        "User-Agent": "Cloudflare-Worker-Telegram-Bot"
-      }
-    });
-
-    if (fileRes.ok) {
-      const content = await fileRes.text();
-      // Guardar el documento original en KV
-      await env.AIZPRUA_WIKI_KV.put(file.path, content);
-      syncedKeys.push(file.path);
-      
-      // Calcular y guardar el embedding semántico
+  // Procesar archivos en lotes paralelos de 5 para acelerar
+  const BATCH_SIZE = 5;
+  for (let i = 0; i < filesList.length; i += BATCH_SIZE) {
+    const batch = filesList.slice(i, i + BATCH_SIZE);
+    await Promise.all(batch.map(async (file) => {
       try {
-        const embedding = await generateEmbedding(env, content);
-        if (embedding) {
-          await env.AIZPRUA_WIKI_KV.put(`embedding:${file.path}`, JSON.stringify(embedding));
-          syncedKeys.push(`embedding:${file.path}`);
-        }
-      } catch (embErr) {
-        console.error(`Error al generar embedding para ${file.path}:`, embErr);
-      }
+        const fileRes = await fetch(file.download_url, {
+          headers: {
+            "Authorization": `token ${env.GITHUB_TOKEN}`,
+            "User-Agent": "Cloudflare-Worker-Telegram-Bot"
+          }
+        });
 
-      filesSyncedCount++;
-    }
+        if (!fileRes.ok) return;
+
+        const content = await fileRes.text();
+        await env.AIZPRUA_WIKI_KV.put(file.path, content);
+        syncedKeys.push(file.path);
+
+        try {
+          const embedding = await generateEmbedding(env, content);
+          if (embedding) {
+            await env.AIZPRUA_WIKI_KV.put(`embedding:${file.path}`, JSON.stringify(embedding));
+            syncedKeys.push(`embedding:${file.path}`);
+          }
+        } catch (embErr) {
+          console.error(`Error al generar embedding para ${file.path}:`, embErr);
+        }
+
+        filesSyncedCount++;
+      } catch (fileErr) {
+        console.error(`Error al procesar ${file.path}:`, fileErr);
+      }
+    }));
   }
 
   // Eliminar documentos y embeddings antiguos que ya no existan en el repositorio
