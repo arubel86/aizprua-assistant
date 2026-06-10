@@ -675,9 +675,24 @@ async function saveChatHistory(env: Env, chatId: number, history: {role: "user" 
    * Soporta 3 modos: 'auto' (Gemini → OpenRouter → Cloudflare AI), 'gemini' (forzado) y 'llama' (forzado).
    */
 async function handleUserQuery(env: Env, chatId: number, query: string): Promise<void> {
-  await sendTelegramTyping(env, chatId);
+  // Indicador de escritura intermitente cada 4s mientras procesa
+  let typingActive = true;
+  const typingPoller = async () => {
+    while (typingActive) {
+      try {
+        const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendChatAction`;
+        await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ chat_id: chatId, action: "typing" })
+        });
+        await new Promise(resolve => setTimeout(resolve, 4000));
+      } catch {}
+    }
+  };
+  typingPoller();
 
-  // 1. Leer lista de archivos desde _file_list (generada por /sync)
+  try {
   const fileListStr = await env.AIZPRUA_WIKI_KV.get("_file_list");
   if (!fileListStr) {
     await sendTelegramMessage(
@@ -798,6 +813,9 @@ ${kbContext}`;
   }
 
   await sendTelegramMessage(env, chatId, "Lamento informarle que actualmente nuestro sistema de consultas automatizadas está experimentando dificultades técnicas. Por favor, intente de nuevo en unos momentos o póngase en contacto con un asesor humano.");
+  } finally {
+    typingActive = false;
+  }
 }
 
 /**
