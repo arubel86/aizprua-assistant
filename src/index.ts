@@ -300,10 +300,26 @@ async function sendTelegramMessage(env: Env, chatId: number, text: string): Prom
 }
 
 /**
+ * Limpia caracteres sueltos de markdown que la IA pueda dejar (**, *, _, #, etc.)
+ * pero preserva el texto entre ellos.
+ */
+function stripMarkdown(text: string): string {
+  return text
+    .replace(/\*\*(.+?)\*\*/g, '$1')
+    .replace(/__(.+?)__/g, '$1')
+    .replace(/\*(.+?)\*/g, '$1')
+    .replace(/_(.+?)_/g, '$1')
+    .replace(/~~(.+?)~~/g, '$1')
+    .replace(/`{1,3}[\s\S]*?`{1,3}/g, '')
+    .replace(/\[(.+?)\]\(.+?\)/g, '$1');
+}
+
+/**
  * Envía un mensaje a Telegram como texto plano (sin parse_mode).
+ * Limpia markdown residual que la IA pueda incluir.
  */
 async function sendTelegramMessagePlain(env: Env, chatId: number, text: string): Promise<void> {
-  const chunks = splitText(text, 4000);
+  const chunks = splitText(stripMarkdown(text), 4000);
   const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
   for (const chunk of chunks) {
     await fetch(url, {
@@ -718,7 +734,7 @@ Tu conocimiento está estrictamente limitado a la información contenida en la "
 
 Directrices de comunicación y formato:
 1. Utilice un tono profesional, corporativo, formal y de absoluto respeto (use el trato de "usted" o estilo corporativo formal).
-2. NO use ningún tipo de formato markdown. No use asteriscos ni numerales ni backticks ni corchetes ni ningún otro carácter de formato. Use solo texto plano.
+2. NO use ningún tipo de formato markdown ni caracteres especiales de formato. No use asteriscos, numerales, backticks, corchetes, guiones bajos ni ningún otro símbolo de markup. Escriba únicamente en texto plano.
 3. Use texto plano limpio y bien estructurado con sangrías, viñetas con guiones (-), numeración (1., 2., etc.) y párrafos separados por línea en blanco.
 4. Cuide la ortografía, los puntos y comas, los espacios y la gramática en general. Cada oración debe comenzar con mayúscula y terminar con punto.
 5. Si el usuario pregunta precios o paquetes de servicio, limítese estrictamente a lo indicado en los documentos de paquetes.
