@@ -769,14 +769,15 @@ ${kbContext}`;
 
 /**
  * Llama al modelo Gemini y devuelve la respuesta como texto.
- * El modelo se configura via env.GEMINI_MODEL o usa gemini-2.0-flash como fallback.
+ * El modelo se configura via env.GEMINI_MODEL.
+ * Fallback: gemini-2.5-flash-preview -> gemini-1.5-flash -> gemini-1.5-pro
  */
 async function callGemini(env: Env, systemPrompt: string, history: {role: string, text: string}[]): Promise<string> {
   const modelsToTry = [
     env.GEMINI_MODEL,
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-1.5-flash"
+    "gemini-2.5-flash-preview",
+    "gemini-1.5-flash",
+    "gemini-1.5-pro"
   ].filter(Boolean) as string[];
 
   let lastError: Error | null = null;
@@ -974,7 +975,7 @@ async function runSystemDiagnostics(env: Env): Promise<string> {
   report += `🐙 *GitHub API:* ${githubStatus}\n`;
 
   // 3. Validar Gemini API
-  const geminiModel = env.GEMINI_MODEL || "gemini-2.5-flash";
+  const geminiModel = env.GEMINI_MODEL || "gemini-2.5-flash-preview";
   let geminiStatus = "✅ Respondiendo";
   try {
     const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=${env.GEMINI_API_KEY}`;
