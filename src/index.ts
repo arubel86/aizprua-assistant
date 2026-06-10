@@ -693,17 +693,16 @@ ${kbContext}`;
   const activeModel = await env.AIZPRUA_WIKI_KV.get("bot:active_model") || "auto";
   const geminiCooldown = await env.AIZPRUA_WIKI_KV.get("gemini_cooldown");
 
-  // Decidir si debemos intentar Gemini
+  // Decidir qué modelos intentar según el modo activo
   const shouldTryGemini = activeModel === "gemini" || (activeModel === "auto" && !geminiCooldown);
-  // Decidir si debemos intentar OpenRouter (como fallback o directo)
-  const shouldTryLlama = (activeModel === "llama" || activeModel === "auto") && !!env.OPENROUTER_API_KEY;
+  const shouldTryOpenRouter = (activeModel === "llama" || activeModel === "auto") && !!env.OPENROUTER_API_KEY;
+  const shouldTryCloudflareAI = (activeModel === "llama" || activeModel === "auto");
 
-  // --- Intentar Gemini ---
+  // --- Intentar Gemini (primario) ---
   if (shouldTryGemini) {
     try {
       const answer = await callGemini(env, systemPrompt, history);
       
-      // Si estamos en modo auto y había cooldown previo, lo limpiamos porque Gemini se recuperó
       if (activeModel === "auto") {
         await env.AIZPRUA_WIKI_KV.delete("gemini_cooldown");
       }
@@ -717,55 +716,60 @@ ${kbContext}`;
       console.error("Error al consultar Gemini:", geminiErrMsg);
 
       if (activeModel === "gemini") {
-        // Modo forzado Gemini: no hay fallback, alertar y disculparse
         await alertAdmin(env, "GEMINI_FAIL", geminiErrMsg, query, chatId);
-        await sendTelegramMessage(
-          env, chatId,
-          "Lamento informarle que Gemini no está disponible en este momento. El administrador ha configurado este modelo como exclusivo. Por favor, intente de nuevo más tarde."
-        );
+        await sendTelegramMessage(env, chatId, "Lamento informarle que Gemini no está disponible en este momento. El administrador ha configurado este modelo como exclusivo. Por favor, intente de nuevo más tarde.");
         return;
       }
 
-      // Modo auto: activar cooldown de 5 minutos para evitar reintentar Gemini innecesariamente
       await alertAdmin(env, "GEMINI_FAIL", geminiErrMsg, query, chatId);
       await env.AIZPRUA_WIKI_KV.put("gemini_cooldown", new Date().toISOString(), { expirationTtl: 300 });
     }
   }
 
-  // --- Intentar OpenRouter (como fallback en modo auto, o como modelo principal en modo llama) ---
-  if (shouldTryLlama) {
+  // --- Intentar OpenRouter (primer fallback) ---
+  if (shouldTryOpenRouter) {
     try {
       const orAnswer = await callOpenRouter(env, systemPrompt, history);
 
       history.push({ role: "model", text: orAnswer });
       await saveChatHistory(env, chatId, history);
 
-      // Solo marcar como contingencia si el modo es 'auto' (no si el admin eligió el modelo manualmente)
       if (activeModel === "auto") {
-        const responseWithFallbackMark = `${orAnswer}\n\n*(Nota: Respuesta procesada por el sistema de contingencia)*`;
-        await sendTelegramMessage(env, chatId, responseWithFallbackMark);
+        await sendTelegramMessage(env, chatId, `${orAnswer}\n\n*(Nota: Respuesta procesada por OpenRouter)*`);
       } else {
         await sendTelegramMessage(env, chatId, orAnswer);
       }
       return;
     } catch (fallbackErr: any) {
-      const fallbackErrMsg = fallbackErr.message || fallbackErr;
-      console.error("Fallo en OpenRouter:", fallbackErrMsg);
+      console.error("Fallo en OpenRouter:", fallbackErr.message || fallbackErr);
+      await alertAdmin(env, "OPENROUTER_FAIL", fallbackErr.message || fallbackErr, query, chatId);
+    }
+  }
+
+  // --- Intentar Cloudflare AI (segundo fallback / último recurso) ---
+  if (shouldTryCloudflareAI) {
+    try {
+      const cfAnswer = await callCloudflareAI(env, systemPrompt, history);
+
+      history.push({ role: "model", text: cfAnswer });
+      await saveChatHistory(env, chatId, history);
+
+      const mark = activeModel === "auto" ? "\n\n*(Nota: Respuesta procesada por Cloudflare AI - último recurso)*" : "";
+      await sendTelegramMessage(env, chatId, `${cfAnswer}${mark}`);
+      return;
+    } catch (lastErr: any) {
+      const lastErrMsg = lastErr.message || lastErr;
+      console.error("Fallo en Cloudflare AI:", lastErrMsg);
 
       if (activeModel === "llama") {
-        await alertAdmin(env, "OPENROUTER_FAIL", fallbackErrMsg, query, chatId);
+        await alertAdmin(env, "CLOUDFLARE_AI_FAIL", lastErrMsg, query, chatId);
       } else {
-        await alertAdmin(env, "TOTAL_FAIL", `OpenRouter falló con: "${fallbackErrMsg}"`, query, chatId);
+        await alertAdmin(env, "TOTAL_FAIL", `Cloudflare AI falló con: "${lastErrMsg}"`, query, chatId);
       }
     }
   }
 
-  // Si llegamos aquí, ningún modelo respondió
-  await sendTelegramMessage(
-    env, 
-    chatId, 
-    "Lamento informarle que actualmente nuestro sistema de consultas automatizadas está experimentando dificultades técnicas. Por favor, intente de nuevo en unos momentos o póngase en contacto con un asesor humano."
-  );
+  await sendTelegramMessage(env, chatId, "Lamento informarle que actualmente nuestro sistema de consultas automatizadas está experimentando dificultades técnicas. Por favor, intente de nuevo en unos momentos o póngase en contacto con un asesor humano.");
 }
 
 /**
@@ -883,6 +887,46 @@ async function callOpenRouter(env: Env, systemPrompt: string, history: {role: st
 }
 
 /**
+ * Llama a Cloudflare Workers AI (Llama 3.1 8B) como último recurso.
+ */
+async function callCloudflareAI(env: Env, systemPrompt: string, history: {role: string, text: string}[]): Promise<string> {
+  let systemPromptCf = systemPrompt + "\n\nREGLA ESTRICTA ADICIONAL: Eres un modelo de respaldo. TIENES ESTRICTAMENTE PROHIBIDO INVENTAR NOMBRES DE PRODUCTOS, MARCAS, LEYES O DATOS QUE NO ESTÉN EN LA BASE DE CONOCIMIENTO. Si la información no está, responde ÚNICAMENTE: 'No dispongo de esa información en mis registros, por favor contacte a un asesor humano.'";
+  if (systemPromptCf.length > 6000) {
+    systemPromptCf = systemPrompt.substring(0, 6000) + "\n\n[Contexto truncado por límites del modelo de respaldo]";
+  }
+
+  const messages = [
+    { role: "system", content: systemPromptCf },
+    ...history.map((h, index) => {
+      let content = h.text;
+      if (index === history.length - 1 && h.role !== "model") {
+        content += "\n\n[RECORDATORIO OBLIGATORIO DEL SISTEMA: Usa siempre guiones (-) para listas, NUNCA asteriscos (*). TIENES ESTRICTAMENTE PROHIBIDO inventar datos, enlaces o sugerencias que no estén en tu base de conocimiento corporativa. Si no lo sabes, di 'No dispongo de esa información.']";
+      }
+      return { role: h.role === "model" ? "assistant" : "user", content };
+    })
+  ];
+
+  const res = await env.AI.run("@cf/meta/llama-3.1-8b-instruct", {
+    messages,
+    max_tokens: 1200,
+    temperature: 0.1
+  }) as any;
+
+  let answer = "";
+  if (typeof res === "string") {
+    answer = res;
+  } else if (res && typeof res === "object") {
+    answer = res.response || res.text || res.result?.response || "";
+  }
+
+  if (!answer.trim()) {
+    throw new Error("Respuesta vacía de Cloudflare AI");
+  }
+
+  return answer;
+}
+
+/**
  * Envía una alerta estructurada al administrador de Telegram si ocurre un fallo.
  * Cuenta con un mecanismo de cooldown de 10 minutos por tipo de error para evitar spam.
  */
@@ -904,6 +948,7 @@ async function alertAdmin(env: Env, errorType: string, errorMsg: string, query?:
   const severity = errorType === "TOTAL_FAIL" ? "CRÍTICA" : "MEDIA";
   const component = errorType === "GEMINI_FAIL" ? "Gemini" 
                   : errorType === "OPENROUTER_FAIL" ? "OpenRouter (Nemotron)" 
+                  : errorType === "CLOUDFLARE_AI_FAIL" ? "Cloudflare AI (Llama)" 
                   : errorType === "SYNC_FAIL" ? "Sincronizador GitHub" 
                   : "Sistema Completo";
 
@@ -924,7 +969,9 @@ async function alertAdmin(env: Env, errorType: string, errorMsg: string, query?:
   alertMsg += `━━━━━━━━━━━━━━━━━━━━━━\n`;
   
   if (errorType === "GEMINI_FAIL") {
-    alertMsg += `⚙️ *Acción:* Se activó OpenRouter (Nemotron) como respaldo automáticamente.`;
+    alertMsg += `⚙️ *Acción:* Se activó OpenRouter como respaldo.`;
+  } else if (errorType === "OPENROUTER_FAIL") {
+    alertMsg += `⚙️ *Acción:* Se activó Cloudflare AI (Llama) como último recurso.`;
   } else if (errorType === "TOTAL_FAIL") {
     alertMsg += `⚙️ *Acción:* Se envió mensaje de disculpa. Requiere revisión.`;
   } else if (errorType === "SYNC_FAIL") {
@@ -1030,6 +1077,24 @@ async function runSystemDiagnostics(env: Env): Promise<string> {
     }
   }
   report += `🧠 *OpenRouter (Nemotron):* ${orStatus}\n`;
+
+  // 5. Validar Cloudflare AI (Llama) como último recurso
+  let cfAIStatus = "✅ Respondiendo";
+  try {
+    const cfRes = await env.AI.run("@cf/meta/llama-3.1-8b-instruct", {
+      messages: [{ role: "user", content: "Hi" }],
+      max_tokens: 5
+    }) as any;
+    if (!cfRes || (!cfRes.response && !cfRes.text)) {
+      throw new Error("Respuesta vacía");
+    }
+  } catch (err: any) {
+    cfAIStatus = `⚠️ Error (${err.message || err})`;
+    if (overallStatus === "✅ Todo operativo") {
+      overallStatus = "⚠️ Backup Cloudflare AI no disponible";
+    }
+  }
+  report += `☁️ *Cloudflare AI (Llama):* ${cfAIStatus}\n`;
 
   // 5. Contar documentos
   try {
