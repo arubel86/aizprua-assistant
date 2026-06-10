@@ -1,0 +1,18 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "aizprua-assistant",
+  "main": "src/index.ts",
+  "compatibility_date": "2024-10-22",
+  "observability": {
+    "enabled": true
+  },
+  "kv_namespaces": [
+    {
+      "binding": "AIZPRUA_WIKI_KV",
+      "id": "80c7bdf7a44d4b3b9517531eb462c3a4"
+    }
+  ],
+  "ai": {
+    "binding": "AI"
+  }
+}
