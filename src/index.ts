@@ -5,6 +5,7 @@ export interface Env {
   ADMIN_TELEGRAM_ID: string;
   AIZPRUA_WIKI_KV: KVNamespace;
   AI: any; // Binding nativo de Cloudflare Workers AI
+  WEBHOOK_SECRET?: string; // Secreto para verificar webhooks de GitHub
 }
 
 export default {
@@ -18,8 +19,18 @@ export default {
     }
 
     try {
+      // Verificar si es un webhook de GitHub (por el header X-GitHub-Event)
+      const githubEvent = request.headers.get("X-GitHub-Event");
+      if (githubEvent) {
+        return await handleGitHubWebhookRequest(request, env, ctx);
+      }
+
       const payload = await request.json() as any;
-      if (!payload || !payload.message) {
+      if (!payload) {
+        return new Response("No payload", { status: 200 });
+      }
+
+      if (!payload.message) {
         return new Response("No message payload", { status: 200 });
       }
 
@@ -423,6 +434,97 @@ async function syncGitHubWiki(env: Env, chatId: number): Promise<void> {
     chatId,
     `¡Sincronización completada! 📚\nSe han actualizado y guardado ${filesSyncedCount} documentos (con sus respectivos embeddings semánticos) en la base de datos de Cloudflare KV.`
   );
+}
+
+/**
+ * Maneja una petición entrante de webhook de GitHub.
+ * Verifica la firma HMAC-SHA256 y procesa el evento.
+ */
+async function handleGitHubWebhookRequest(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const githubEvent = request.headers.get("X-GitHub-Event") || "";
+  const signature = request.headers.get("X-Hub-Signature-256") || "";
+
+  // Verificar la firma si WEBHOOK_SECRET está configurado
+  if (env.WEBHOOK_SECRET) {
+    const body = await request.clone().text();
+    const expectedSig = "sha256=" + await computeHMACSHA256(env.WEBHOOK_SECRET, body);
+    if (!signature || expectedSig !== signature) {
+      console.error("Firma de webhook inválida");
+      return new Response("Firma inválida", { status: 401 });
+    }
+
+    // Procesar el payload después de verificar
+    const payload = JSON.parse(body);
+
+    // Ping event (se envía al configurar el webhook)
+    if (githubEvent === "ping") {
+      console.log("GitHub webhook ping recibido:", payload.zen || "OK");
+      return new Response("pong", { status: 200 });
+    }
+
+    // Push event
+    if (githubEvent === "push") {
+      // Solo procesar pushes a main
+      if (payload.ref !== "refs/heads/main") {
+        return new Response("Rama ignorada", { status: 200 });
+      }
+
+      ctx.waitUntil(processGitHubPush(env, payload));
+      return new Response("Sincronización iniciada", { status: 200 });
+    }
+
+    return new Response(`Evento ${githubEvent} ignorado`, { status: 200 });
+  }
+
+  // Si no hay WEBHOOK_SECRET, procesar igual pero con menos seguridad
+  const payload = await request.json() as any;
+
+  if (githubEvent === "ping") {
+    return new Response("pong", { status: 200 });
+  }
+
+  if (githubEvent === "push" && payload.ref === "refs/heads/main") {
+    ctx.waitUntil(processGitHubPush(env, payload));
+    return new Response("Sincronización iniciada", { status: 200 });
+  }
+
+  return new Response("OK", { status: 200 });
+}
+
+/**
+ * Procesa un push de GitHub a main: sincroniza la wiki y notifica al admin.
+ */
+async function processGitHubPush(env: Env, payload: any): Promise<void> {
+  const repoFullName = payload.repository?.full_name || "desconocido";
+  const pusherName = payload.pusher?.name || "desconocido";
+  const commitCount = payload.commits?.length || 0;
+
+  console.log(`GitHub push: ${commitCount} commits en ${repoFullName} por ${pusherName}`);
+
+  await sendTelegramMessage(
+    env,
+    parseInt(env.ADMIN_TELEGRAM_ID),
+    `🔄 *Sincronización automática iniciada*\n\nSe detectaron ${commitCount} nuevo(s) commit(s) en \`${repoFullName}\` por *${pusherName}*.\n\nActualizando base de conocimiento... ⏳`
+  );
+
+  try {
+    await syncGitHubWiki(env, parseInt(env.ADMIN_TELEGRAM_ID));
+  } catch (err: any) {
+    const errMsg = err.message || err;
+    console.error("Error en sincronización automática por webhook:", errMsg);
+    await alertAdmin(env, "SYNC_FAIL", errMsg);
+  }
+}
+
+/**
+ * Calcula HMAC-SHA256 para verificar firmas de webhook de GitHub.
+ */
+async function computeHMACSHA256(secret: string, body: string): Promise<string> {
+  const key = new TextEncoder().encode(secret);
+  const data = new TextEncoder().encode(body);
+  const cryptoKey = await crypto.subtle.importKey("raw", key, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sig = await crypto.subtle.sign("HMAC", cryptoKey, data);
+  return Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, "0")).join("");
 }
 
 /**
