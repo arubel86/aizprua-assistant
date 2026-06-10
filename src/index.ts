@@ -337,46 +337,57 @@ async function syncGitHubWiki(env: Env, chatId: number): Promise<void> {
   let filesSyncedCount = 0;
   const filesList: { name: string; path: string; download_url: string }[] = [];
 
-  // Helper interno recursivo para explorar carpetas de GitHub
+  // Helper interno recursivo para explorar carpetas de GitHub con paginación
   async function traverse(path: string) {
-    const url = `https://api.github.com/repos/arubel86/Aizpruase-Documentos-Tramites/contents/${encodeURIComponent(path)}`;
-    const response = await fetch(url, {
-      headers: {
-        "Authorization": `token ${env.GITHUB_TOKEN}`,
-        "User-Agent": "Cloudflare-Worker-Telegram-Bot",
-        "Accept": "application/vnd.github.v3+json"
-      }
-    });
+    let page = 1;
+    let hasMore = true;
 
-    if (!response.ok) {
-      if (response.status === 404) return;
-      throw new Error(`Error al leer GitHub: ${path} (Status ${response.status})`);
-    }
+    while (hasMore) {
+      const url = `https://api.github.com/repos/arubel86/Aizpruase-Documentos-Tramites/contents/${encodeURIComponent(path)}?per_page=100&page=${page}`;
+      const response = await fetch(url, {
+        headers: {
+          "Authorization": `token ${env.GITHUB_TOKEN}`,
+          "User-Agent": "Cloudflare-Worker-Telegram-Bot",
+          "Accept": "application/vnd.github.v3+json"
+        }
+      });
 
-    const items = await response.json() as any[];
-    for (const item of items) {
-      // Ignorar archivos y carpetas ocultas/de configuración (.agents, .git, etc.)
-      if (item.name.startsWith('.')) continue;
-
-      // Ignorar carpetas de herramientas, scripts o proyectos de código
-      if (
-        item.path.includes('Video-Project') ||
-        item.path.includes('Calculadora') ||
-        item.path.includes('talnect-brain') ||
-        item.path.includes('6. Herramientas')
-      ) {
-        continue;
+      if (!response.ok) {
+        if (response.status === 404) return;
+        throw new Error(`Error al leer GitHub: ${path} (Status ${response.status})`);
       }
 
-      if (item.type === 'dir') {
-        await traverse(item.path);
-      } else if (item.type === 'file' && item.name.endsWith('.md')) {
-        filesList.push({
-          name: item.name,
-          path: item.path,
-          download_url: item.download_url
-        });
+      const items = await response.json() as any[];
+      if (items.length === 0) { hasMore = false; break; }
+
+      for (const item of items) {
+        // Ignorar archivos y carpetas ocultas/de configuración (.agents, .git, etc.)
+        if (item.name.startsWith('.')) continue;
+
+        // Ignorar carpetas de herramientas, scripts o proyectos de código
+        if (
+          item.path.includes('Video-Project') ||
+          item.path.includes('Calculadora') ||
+          item.path.includes('talnect-brain') ||
+          item.path.includes('6. Herramientas')
+        ) {
+          continue;
+        }
+
+        if (item.type === 'dir') {
+          await traverse(item.path);
+        } else if (item.type === 'file' && item.name.endsWith('.md')) {
+          filesList.push({
+            name: item.name,
+            path: item.path,
+            download_url: item.download_url
+          });
+        }
       }
+
+      // Si GitHub devolvió menos de 100 items, es la última página
+      if (items.length < 100) { hasMore = false; }
+      page++;
     }
   }
 
@@ -417,17 +428,20 @@ async function syncGitHubWiki(env: Env, chatId: number): Promise<void> {
 
   // Eliminar documentos y embeddings antiguos que ya no existan en el repositorio
   try {
-    const list = await env.AIZPRUA_WIKI_KV.list();
     const syncedSet = new Set(syncedKeys);
-    for (const key of list.keys) {
-      // Solo limpiar claves del repositorio (archivos .md y sus embeddings)
-      if (
-        (key.name.endsWith(".md") || key.name.startsWith("embedding:")) &&
-        !syncedSet.has(key.name)
-      ) {
-        await env.AIZPRUA_WIKI_KV.delete(key.name);
+    let cursor: string | undefined;
+    do {
+      const list = await env.AIZPRUA_WIKI_KV.list({ cursor });
+      for (const key of list.keys) {
+        if (
+          (key.name.endsWith(".md") || key.name.startsWith("embedding:")) &&
+          !syncedSet.has(key.name)
+        ) {
+          await env.AIZPRUA_WIKI_KV.delete(key.name);
+        }
       }
-    }
+      cursor = list.list_complete ? undefined : list.cursor;
+    } while (cursor);
   } catch (cleanErr) {
     console.error("Error al limpiar claves antiguas en KV:", cleanErr);
   }
@@ -435,7 +449,7 @@ async function syncGitHubWiki(env: Env, chatId: number): Promise<void> {
   await sendTelegramMessage(
     env,
     chatId,
-    `¡Sincronización completada! 📚\nSe han actualizado y guardado ${filesSyncedCount} documentos (con sus respectivos embeddings semánticos) en la base de datos de Cloudflare KV.`
+    `¡Sincronización completada! 📚\nSe han encontrado ${filesList.length} documentos .md en GitHub, de los cuales se actualizaron y guardaron ${filesSyncedCount} (con sus respectivos embeddings semánticos) en la base de datos de Cloudflare KV.`
   );
 }
 
@@ -534,9 +548,7 @@ async function computeHMACSHA256(secret: string, body: string): Promise<string> 
  * Filtra y devuelve únicamente los documentos relevantes de la base de conocimiento en base a las palabras clave de la pregunta.
  * Esto optimiza el consumo de tokens y evita desbordar el contexto de la IA.
  */
-async function getRelevantContext(env: Env, query: string, list: any): Promise<string> {
-  const docKeys = list.keys.filter((k: any) => k.name.endsWith(".md") && !k.name.startsWith("embedding:"));
-  
+async function getRelevantContext(env: Env, query: string, docKeys: string[]): Promise<string> {
   let queryVector: number[] | null = null;
   try {
     queryVector = await generateEmbedding(env, query);
@@ -552,31 +564,31 @@ async function getRelevantContext(env: Env, query: string, list: any): Promise<s
 
   for (const key of docKeys) {
     try {
-      const embStr = await env.AIZPRUA_WIKI_KV.get(`embedding:${key.name}`);
+      const embStr = await env.AIZPRUA_WIKI_KV.get(`embedding:${key}`);
       if (embStr) {
         const vector = JSON.parse(embStr);
         if (Array.isArray(vector) && vector.length > 0) {
           const sim = cosineSimilarity(queryVector, vector);
-          similarities.push({ key: key.name, similarity: sim });
+          similarities.push({ key, similarity: sim });
         }
       }
     } catch (err) {
-      console.error(`Error calculando similitud para ${key.name}:`, err);
+      console.error(`Error calculando similitud para ${key}:`, err);
     }
   }
 
   // Ordenar de mayor a menor similitud
   similarities.sort((a, b) => b.similarity - a.similarity);
 
-  // Seleccionar los mejores 3
-  const topDocs = similarities.slice(0, 3);
+  // Seleccionar los mejores 8 documentos (antes eran 3)
+  const topDocs = similarities.slice(0, 8);
   
   let context = "";
   let filesIncluded = 0;
 
   for (const item of topDocs) {
-    // Aceptamos documentos con similitud razonable (> 0.35)
-    if (item.similarity > 0.35) {
+    // Aceptamos documentos con similitud mínima de 0.25 (antes era 0.35)
+    if (item.similarity > 0.25) {
       const fileContent = await env.AIZPRUA_WIKI_KV.get(item.key);
       if (fileContent) {
         const fileNameClean = item.key.split('/').pop()?.replace('.md', '') || item.key;
@@ -642,10 +654,16 @@ async function saveChatHistory(env: Env, chatId: number, history: {role: "user" 
 async function handleUserQuery(env: Env, chatId: number, query: string): Promise<void> {
   await sendTelegramTyping(env, chatId);
 
-  // 1. Listar todas las llaves en KV
-  const list = await env.AIZPRUA_WIKI_KV.list();
-  
-  if (list.keys.length === 0) {
+  // 1. Listar solo documentos .md en KV (con paginación para evitar límite de 1000)
+  let allDocKeys: string[] = [];
+  let cursor: string | undefined;
+  do {
+    const result = await env.AIZPRUA_WIKI_KV.list({ cursor, prefix: "" });
+    allDocKeys.push(...result.keys.filter(k => k.name.endsWith(".md") && !k.name.startsWith("embedding:")).map(k => k.name));
+    cursor = result.list_complete ? undefined : result.cursor;
+  } while (cursor);
+
+  if (allDocKeys.length === 0) {
     await sendTelegramMessage(
       env, 
       chatId, 
@@ -655,7 +673,7 @@ async function handleUserQuery(env: Env, chatId: number, query: string): Promise
   }
 
   // 2. Obtener contexto optimizado y filtrado
-  const kbContext = await getRelevantContext(env, query, list);
+  const kbContext = await getRelevantContext(env, query, allDocKeys);
 
   // 3. Prompt de sistema con las reglas de Aizprua S.E.
   const systemPrompt = `Eres el asistente virtual oficial de "Aizprua S.E." (Aizprua Servicios Especiales). Tu comportamiento debe ser sumamente profesional, respetuoso y formal.
@@ -1193,8 +1211,8 @@ function cosineSimilarity(vecA: number[], vecB: number[]): number {
 /**
  * Búsqueda clásica por palabras clave (fallback cuando falla embeddings o no hay coincidencias semánticas).
  */
-async function getRelevantContextKeywordFallback(env: Env, query: string, docKeys: any[]): Promise<string> {
-  const stopWords = new Set(["el", "la", "los", "las", "un", "una", "unos", "unas", "de", "del", "y", "o", "e", "u", "a", "en", "para", "por", "con", "sin", "sobre", "que", "es", "son", "se", "lo", "como", "cual", "cuales", "como", "donde", "cuando", "quien", "cuanto", "cuantos"]);
+async function getRelevantContextKeywordFallback(env: Env, query: string, docKeys: string[]): Promise<string> {
+  const stopWords = new Set(["el", "la", "los", "las", "un", "una", "unos", "unas", "de", "del", "y", "o", "e", "u", "a", "en", "para", "por", "con", "sin", "sobre", "que", "es", "son", "se", "lo", "como", "cual", "cuales", "donde", "cuando", "quien", "cuanto", "cuantos"]);
   
   const keywords = query.toLowerCase()
     .replace(/[¿?¡!.,;:#()]/g, "")
@@ -1205,31 +1223,31 @@ async function getRelevantContextKeywordFallback(env: Env, query: string, docKey
   let filesIncluded = 0;
 
   for (const key of docKeys) {
-    const fileContent = await env.AIZPRUA_WIKI_KV.get(key.name);
+    const fileContent = await env.AIZPRUA_WIKI_KV.get(key);
     if (!fileContent) continue;
 
     const contentLower = fileContent.toLowerCase();
-    const fileNameLower = key.name.toLowerCase();
+    const fileNameLower = key.toLowerCase();
     
     const isMatch = keywords.some(keyword => fileNameLower.includes(keyword) || contentLower.includes(keyword));
-    const isIndex = key.name.endsWith("index.md");
+    const isIndex = key.endsWith("index.md");
 
     if (isMatch || isIndex) {
-      const fileNameClean = key.name.split('/').pop()?.replace('.md', '') || key.name;
+      const fileNameClean = key.split('/').pop()?.replace('.md', '') || key;
       context += `\n--- Tema/Documento: ${fileNameClean} ---\n${fileContent}\n`;
       filesIncluded++;
     }
   }
 
-  // Si no coincide casi nada, incluimos por defecto los primeros 5 documentos
+  // Si no coincide casi nada, incluimos por defecto los primeros 8 documentos
   if (filesIncluded <= 1) {
     context = "";
-    const limit = Math.min(docKeys.length, 5);
+    const limit = Math.min(docKeys.length, 8);
     for (let i = 0; i < limit; i++) {
       const key = docKeys[i];
-      const fileContent = await env.AIZPRUA_WIKI_KV.get(key.name);
+      const fileContent = await env.AIZPRUA_WIKI_KV.get(key);
       if (fileContent) {
-        const fileNameClean = key.name.split('/').pop()?.replace('.md', '') || key.name;
+        const fileNameClean = key.split('/').pop()?.replace('.md', '') || key;
         context += `\n--- Tema/Documento: ${fileNameClean} ---\n${fileContent}\n`;
       }
     }
