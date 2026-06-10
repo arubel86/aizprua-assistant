@@ -136,8 +136,8 @@ export default {
         return new Response("OK", { status: 200 });
       }
 
-      // Explicación Racional: Comandos de Administración de Whitelist
-      // Permiten al admin agregar, remover y ver los usuarios autorizados directamente desde Telegram.
+  // Explicación Racional: Comandos de Administración de Whitelist
+  // Permiten al admin agregar, remover y ver los usuarios autorizados directamente desde Telegram.
       
       // Comando para autorizar usuarios (solo admin)
       if (text.startsWith("/allow")) {
@@ -215,9 +215,8 @@ export default {
       }
 
       // Explicación Racional: Comando /model para Selección de Modelo de IA
-      // Permite al admin cambiar entre: 'auto' (Gemini con fallback a Llama),
-      // 'gemini' (solo Gemini, sin fallback) o 'llama' (solo Llama, sin Gemini).
-      // El modo se persiste en KV con la clave 'bot:active_model'.
+      // Permite al admin cambiar entre: 'auto' (Gemini con fallbacks),
+      // 'gemini' (solo Gemini) o 'llama' (solo OpenRouter + Cloudflare AI).
       if (text.startsWith("/model")) {
         if (!isAdmin) {
           await sendTelegramMessage(env, chatId, "Lo siento, no tienes permisos de administrador. ❌");
@@ -228,26 +227,25 @@ export default {
         const selectedModel = parts[1]?.toLowerCase();
 
         if (!selectedModel) {
-          // Mostrar estado actual
           const currentModel = await env.AIZPRUA_WIKI_KV.get("bot:active_model") || "auto";
           const cooldown = await env.AIZPRUA_WIKI_KV.get("gemini_cooldown");
 
           const modelLabels: Record<string, string> = {
-            "auto": "🔄 Automático (Gemini → Llama)",
-            "gemini": "🤖 Gemini 2.5 Flash (forzado)",
-            "llama": "🧠 Llama 3.1 8B (forzado)"
+            "auto": "🔄 Automático (Gemini → OpenRouter → Cloudflare AI)",
+            "gemini": "🤖 Gemini (forzado, sin respaldo)",
+            "llama": "🧠 Nemotron + Cloudflare AI (sin Gemini)"
           };
 
           let statusMsg = `⚙️ *Configuración del Modelo de IA*\n━━━━━━━━━━━━━━━━━━━━━━\n`;
           statusMsg += `📌 *Modo actual:* ${modelLabels[currentModel] || modelLabels["auto"]}\n`;
           if (currentModel === "auto" && cooldown) {
-            statusMsg += `⏳ *Gemini en cooldown:* Temporalmente usando Llama (se reintentará Gemini automáticamente)\n`;
+            statusMsg += `⏳ *Gemini en cooldown:* Usando OpenRouter/Nemotron (se reintentará Gemini automáticamente)\n`;
           }
           statusMsg += `━━━━━━━━━━━━━━━━━━━━━━\n`;
           statusMsg += `*Comandos disponibles:*\n`;
-          statusMsg += `• \`/model auto\` — Gemini principal + Llama respaldo\n`;
+          statusMsg += `• \`/model auto\` — Gemini → OpenRouter → Cloudflare AI\n`;
           statusMsg += `• \`/model gemini\` — Solo Gemini (sin respaldo)\n`;
-          statusMsg += `• \`/model llama\` — Solo Llama (sin Gemini)\n`;
+          statusMsg += `• \`/model llama\` — Solo Nemotron + Cloudflare AI\n`;
 
           await sendTelegramMessage(env, chatId, statusMsg);
           return new Response("OK", { status: 200 });
@@ -260,15 +258,14 @@ export default {
 
         await env.AIZPRUA_WIKI_KV.put("bot:active_model", selectedModel);
 
-        // Si se cambió a auto o gemini, limpiar el cooldown para permitir reintentar
         if (selectedModel !== "llama") {
           await env.AIZPRUA_WIKI_KV.delete("gemini_cooldown");
         }
 
         const confirmLabels: Record<string, string> = {
-          "auto": "🔄 *Automático* — Gemini 2.5 Flash como principal con Llama 3.1 como respaldo",
-          "gemini": "🤖 *Gemini 2.5 Flash* — Modelo forzado (sin respaldo automático)",
-          "llama": "🧠 *Llama 3.1 8B* — Modelo forzado (sin Gemini)"
+          "auto": "🔄 *Automático* — Gemini como principal, OpenRouter (Nemotron) como respaldo, Cloudflare AI como último recurso",
+          "gemini": "🤖 *Gemini* — Solo Gemini, sin respaldo automático",
+          "llama": "🧠 *Nemotron + Cloudflare AI* — Sin Gemini, usa OpenRouter y Cloudflare AI"
         };
 
         await sendTelegramMessage(env, chatId, `✅ Modelo de IA actualizado a:\n${confirmLabels[selectedModel]}`);
@@ -638,10 +635,10 @@ async function saveChatHistory(env: Env, chatId: number, history: {role: "user" 
   await env.AIZPRUA_WIKI_KV.put(historyKey, JSON.stringify(history), { expirationTtl: 1800 });
 }
 
-/**
- * Lee la base de conocimiento desde Cloudflare KV, arma el contexto y llama al modelo de IA configurado.
- * Soporta 3 modos: 'auto' (Gemini + fallback Llama con auto-recuperación), 'gemini' (forzado) y 'llama' (forzado).
- */
+  /**
+   * Lee la base de conocimiento desde Cloudflare KV, arma el contexto y llama al modelo de IA configurado.
+   * Soporta 3 modos: 'auto' (Gemini → OpenRouter → Cloudflare AI), 'gemini' (forzado) y 'llama' (forzado).
+   */
 async function handleUserQuery(env: Env, chatId: number, query: string): Promise<void> {
   await sendTelegramTyping(env, chatId);
 
@@ -687,9 +684,9 @@ ${kbContext}`;
 
   // Explicación Racional: Selección Dinámica de Modelo
   // Se lee el modo configurado ('auto', 'gemini', 'llama') desde KV.
-  // En modo 'auto', si Gemini falló recientemente (cooldown activo de 5 min), se va directo
-  // a Llama sin perder latencia esperando otro 503. Al expirar el cooldown, Gemini se
-  // reintenta automáticamente como primario.
+  // En modo 'auto', si Gemini falló recientemente (cooldown activo de 5 min), se salta
+  // Gemini y va directo a OpenRouter. Si OpenRouter falla, usa Cloudflare AI (Llama) como
+  // último recurso. Al expirar el cooldown, Gemini se reintenta automáticamente.
   const activeModel = await env.AIZPRUA_WIKI_KV.get("bot:active_model") || "auto";
   const geminiCooldown = await env.AIZPRUA_WIKI_KV.get("gemini_cooldown");
 
@@ -986,7 +983,7 @@ async function alertAdmin(env: Env, errorType: string, errorMsg: string, query?:
 }
 
 /**
- * Corre pruebas de diagnóstico sobre Cloudflare KV, GitHub API, Gemini y Llama 3.1.
+ * Corre pruebas de diagnóstico sobre Cloudflare KV, GitHub API, Gemini, OpenRouter y Cloudflare AI.
  */
 async function runSystemDiagnostics(env: Env): Promise<string> {
   let report = `🏥 *Diagnóstico del Sistema*\n━━━━━━━━━━━━━━━━━━━━━━\n`;
