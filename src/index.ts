@@ -418,16 +418,6 @@ async function syncGitHubWiki(env: Env, chatId: number): Promise<void> {
         await env.AIZPRUA_WIKI_KV.put(file.path, content);
         syncedKeys.push(file.path);
 
-        try {
-          const embedding = await generateEmbedding(env, content);
-          if (embedding) {
-            await env.AIZPRUA_WIKI_KV.put(`embedding:${file.path}`, JSON.stringify(embedding));
-            syncedKeys.push(`embedding:${file.path}`);
-          }
-        } catch (embErr) {
-          console.error(`Error al generar embedding para ${file.path}:`, embErr);
-        }
-
         filesSyncedCount++;
       } catch (fileErr) {
         console.error(`Error al procesar ${file.path}:`, fileErr);
@@ -435,7 +425,8 @@ async function syncGitHubWiki(env: Env, chatId: number): Promise<void> {
     }));
   }
 
-  // Eliminar documentos y embeddings antiguos que ya no existan en el repositorio
+  // Eliminar documentos .md antiguos que ya no existan en el repositorio
+  // (los embeddings se regeneran bajo demanda, no se borran)
   let cleanedCount = 0;
   try {
     const syncedSet = new Set(syncedKeys);
@@ -443,11 +434,10 @@ async function syncGitHubWiki(env: Env, chatId: number): Promise<void> {
     do {
       const list = await env.AIZPRUA_WIKI_KV.list({ cursor });
       for (const key of list.keys) {
-        if (
-          (key.name.endsWith(".md") || key.name.startsWith("embedding:")) &&
-          !syncedSet.has(key.name)
-        ) {
+        if (key.name.endsWith(".md") && !syncedSet.has(key.name)) {
+          // Borrar el documento y su embedding asociado
           await env.AIZPRUA_WIKI_KV.delete(key.name);
+          await env.AIZPRUA_WIKI_KV.delete(`embedding:${key.name}`).catch(() => {});
           cleanedCount++;
         }
       }
@@ -575,7 +565,20 @@ async function getRelevantContext(env: Env, query: string, docKeys: string[]): P
 
   for (const key of docKeys) {
     try {
-      const embStr = await env.AIZPRUA_WIKI_KV.get(`embedding:${key}`);
+      let embStr = await env.AIZPRUA_WIKI_KV.get(`embedding:${key}`);
+      
+      // Si no hay embedding cacheado, generarlo bajo demanda y guardarlo
+      if (!embStr) {
+        const content = await env.AIZPRUA_WIKI_KV.get(key);
+        if (content) {
+          const embedding = await generateEmbedding(env, content);
+          if (embedding) {
+            embStr = JSON.stringify(embedding);
+            await env.AIZPRUA_WIKI_KV.put(`embedding:${key}`, embStr);
+          }
+        }
+      }
+
       if (embStr) {
         const vector = JSON.parse(embStr);
         if (Array.isArray(vector) && vector.length > 0) {
