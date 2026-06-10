@@ -10,22 +10,6 @@ export interface Env {
   OPENROUTER_API_KEY?: string; // API key de OpenRouter (fallback alternativo a Gemini)
 }
 
-/**
- * Limpia caracteres de markdown de un texto para enviarlo como texto plano.
- */
-function cleanMarkdown(text: string): string {
-  return text
-    .replace(/^#+\s*/gm, '')
-    .replace(/\*\*(.+?)\*\*/g, '$1')
-    .replace(/__(.+?)__/g, '$1')
-    .replace(/\*(.+?)\*/g, '$1')
-    .replace(/_(.+?)_/g, '$1')
-    .replace(/`{1,3}[\s\S]*?`{1,3}/g, '')
-    .replace(/~~(.+?)~~/g, '$1')
-    .replace(/\[(.+?)\]\(.+?\)/g, '$1')
-    .trim();
-}
-
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     // Si la petición no es POST, respondemos OK (puede ser un GET de prueba en navegador)
@@ -312,6 +296,21 @@ async function sendTelegramMessage(env: Env, chatId: number, text: string): Prom
   const chunks = splitText(text, 4000);
   for (const chunk of chunks) {
     await sendSingleTelegramMessage(env, chatId, chunk);
+  }
+}
+
+/**
+ * Envía un mensaje a Telegram como texto plano (sin parse_mode).
+ */
+async function sendTelegramMessagePlain(env: Env, chatId: number, text: string): Promise<void> {
+  const chunks = splitText(text, 4000);
+  const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
+  for (const chunk of chunks) {
+    await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text: chunk })
+    });
   }
 }
 
@@ -702,11 +701,13 @@ Tu conocimiento está estrictamente limitado a la información contenida en la "
 - Si la información o respuesta a la pregunta del usuario NO está detallada explícitamente en la base de conocimiento, debes responder formalmente indicando que no dispones de ese detalle en tus registros y sugerir contactar a un asesor humano.
 - Está terminantemente PROHIBIDO inventar, asumir, deducir o especular sobre cualquier dato (precios, leyes, requisitos, nombres, etc.) que no figure textualmente en los documentos provistos.
 
-Directrices de comunicación:
+Directrices de comunicación y formato:
 1. Utilice un tono profesional, corporativo, formal y de absoluto respeto (use el trato de "usted" o estilo corporativo formal).
-2. Mantenga sus respuestas estructuradas, legibles y claras. Evite el uso excesivo de emojis (use máximo uno o dos solo si es pertinente para facilitar la lectura).
-3. Si el usuario pregunta precios o paquetes de servicio, limítese estrictamente a lo indicado en los documentos de paquetes.
-4. IMPORTANTE: NUNCA uses asteriscos (*) para crear listas o viñetas. Usa siempre guiones (-). Los asteriscos solo pueden usarse para **negritas** y deben cerrarse correctamente.
+2. NO use ningún tipo de formato markdown. No use asteriscos ni numerales ni backticks ni corchetes ni ningún otro carácter de formato. Use solo texto plano.
+3. Use texto plano limpio y bien estructurado con sangrías, viñetas con guiones (-), numeración (1., 2., etc.) y párrafos separados por línea en blanco.
+4. Cuide la ortografía, los puntos y comas, los espacios y la gramática en general. Cada oración debe comenzar con mayúscula y terminar con punto.
+5. Si el usuario pregunta precios o paquetes de servicio, limítese estrictamente a lo indicado en los documentos de paquetes.
+6. Evite el uso excesivo de emojis (use máximo uno o dos solo si es pertinente para facilitar la lectura).
 
 Base de conocimiento de la empresa:
 ${kbContext}`;
@@ -743,7 +744,7 @@ ${kbContext}`;
 
       history.push({ role: "model", text: answer });
       await saveChatHistory(env, chatId, history);
-      await sendTelegramMessage(env, chatId, `${cleanMarkdown(answer)}\n\n— 🤖 Gemini`);
+      await sendTelegramMessagePlain(env, chatId, `${answer}\n\n- Gemini`);
       return;
     } catch (err: any) {
       const geminiErrMsg = err.message || err;
@@ -767,7 +768,7 @@ ${kbContext}`;
 
       history.push({ role: "model", text: orAnswer });
       await saveChatHistory(env, chatId, history);
-      await sendTelegramMessage(env, chatId, `${cleanMarkdown(orAnswer)}\n\n— 🧠 OpenRouter (Nemotron)`);
+      await sendTelegramMessagePlain(env, chatId, `${orAnswer}\n\n- OpenRouter (Nemotron)`);
       return;
     } catch (fallbackErr: any) {
       console.error("Fallo en OpenRouter:", fallbackErr.message || fallbackErr);
@@ -782,7 +783,7 @@ ${kbContext}`;
 
       history.push({ role: "model", text: cfAnswer });
       await saveChatHistory(env, chatId, history);
-      await sendTelegramMessage(env, chatId, `${cleanMarkdown(cfAnswer)}\n\n— ☁️ Cloudflare AI (Llama)`);
+      await sendTelegramMessagePlain(env, chatId, `${cfAnswer}\n\n- Cloudflare AI (Llama)`);
       return;
     } catch (lastErr: any) {
       const lastErrMsg = lastErr.message || lastErr;
