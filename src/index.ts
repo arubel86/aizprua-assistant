@@ -427,6 +427,7 @@ async function syncGitHubWiki(env: Env, chatId: number): Promise<void> {
   }
 
   // Eliminar documentos y embeddings antiguos que ya no existan en el repositorio
+  let cleanedCount = 0;
   try {
     const syncedSet = new Set(syncedKeys);
     let cursor: string | undefined;
@@ -438,6 +439,7 @@ async function syncGitHubWiki(env: Env, chatId: number): Promise<void> {
           !syncedSet.has(key.name)
         ) {
           await env.AIZPRUA_WIKI_KV.delete(key.name);
+          cleanedCount++;
         }
       }
       cursor = list.list_complete ? undefined : list.cursor;
@@ -449,7 +451,7 @@ async function syncGitHubWiki(env: Env, chatId: number): Promise<void> {
   await sendTelegramMessage(
     env,
     chatId,
-    `¡Sincronización completada! 📚\nSe han encontrado ${filesList.length} documentos .md en GitHub, de los cuales se actualizaron y guardaron ${filesSyncedCount} (con sus respectivos embeddings semánticos) en la base de datos de Cloudflare KV.`
+    `✅ *Sincronización completada* 📚\n━━━━━━━━━━━━━━━━━━━━━━\n📄 Documentos encontrados en GitHub: ${filesList.length}\n💾 Guardados en KV: ${filesSyncedCount}\n🧠 Embeddings generados: ${filesSyncedCount}${cleanedCount > 0 ? `\n🗑️ Documentos antiguos eliminados: ${cleanedCount}` : ""}\n━━━━━━━━━━━━━━━━━━━━━━\nLa base de conocimiento está actualizada y lista para consultas.`
   );
 }
 
