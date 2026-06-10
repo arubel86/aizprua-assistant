@@ -7,6 +7,7 @@ export interface Env {
   AI: any; // Binding nativo de Cloudflare Workers AI
   WEBHOOK_SECRET?: string; // Secreto para verificar webhooks de GitHub
   GEMINI_MODEL?: string; // Modelo de Gemini a usar (default: gemini-2.5-flash)
+  OPENROUTER_API_KEY?: string; // API key de OpenRouter (fallback alternativo a Gemini)
 }
 
 export default {
@@ -694,8 +695,8 @@ ${kbContext}`;
 
   // Decidir si debemos intentar Gemini
   const shouldTryGemini = activeModel === "gemini" || (activeModel === "auto" && !geminiCooldown);
-  // Decidir si debemos intentar Llama (como fallback o directo)
-  const shouldTryLlama = activeModel === "llama" || activeModel === "auto";
+  // Decidir si debemos intentar OpenRouter (como fallback o directo)
+  const shouldTryLlama = (activeModel === "llama" || activeModel === "auto") && !!env.OPENROUTER_API_KEY;
 
   // --- Intentar Gemini ---
   if (shouldTryGemini) {
@@ -731,30 +732,30 @@ ${kbContext}`;
     }
   }
 
-  // --- Intentar Llama (como fallback en modo auto, o como modelo principal en modo llama) ---
+  // --- Intentar OpenRouter (como fallback en modo auto, o como modelo principal en modo llama) ---
   if (shouldTryLlama) {
     try {
-      const llamaAnswer = await callLlama(env, systemPrompt, history);
+      const orAnswer = await callOpenRouter(env, systemPrompt, history);
 
-      history.push({ role: "model", text: llamaAnswer });
+      history.push({ role: "model", text: orAnswer });
       await saveChatHistory(env, chatId, history);
 
-      // Solo marcar como contingencia si el modo es 'auto' (no si el admin eligió Llama voluntariamente)
+      // Solo marcar como contingencia si el modo es 'auto' (no si el admin eligió el modelo manualmente)
       if (activeModel === "auto") {
-        const responseWithFallbackMark = `${llamaAnswer}\n\n*(Nota: Respuesta procesada por el sistema de contingencia)*`;
+        const responseWithFallbackMark = `${orAnswer}\n\n*(Nota: Respuesta procesada por el sistema de contingencia)*`;
         await sendTelegramMessage(env, chatId, responseWithFallbackMark);
       } else {
-        await sendTelegramMessage(env, chatId, llamaAnswer);
+        await sendTelegramMessage(env, chatId, orAnswer);
       }
       return;
     } catch (fallbackErr: any) {
-      const llamaErrMsg = fallbackErr.message || fallbackErr;
-      console.error("Fallo en Llama 3.1:", llamaErrMsg);
+      const fallbackErrMsg = fallbackErr.message || fallbackErr;
+      console.error("Fallo en OpenRouter:", fallbackErrMsg);
 
       if (activeModel === "llama") {
-        await alertAdmin(env, "LLAMA_FAIL", llamaErrMsg, query, chatId);
+        await alertAdmin(env, "OPENROUTER_FAIL", fallbackErrMsg, query, chatId);
       } else {
-        await alertAdmin(env, "TOTAL_FAIL", `Llama 3 falló con: "${llamaErrMsg}"`, query, chatId);
+        await alertAdmin(env, "TOTAL_FAIL", `OpenRouter falló con: "${fallbackErrMsg}"`, query, chatId);
       }
     }
   }
@@ -833,49 +834,52 @@ async function tryGeminiModel(env: Env, model: string, systemPrompt: string, his
 }
 
 /**
- * Llama al modelo Llama 3.1 8B vía Cloudflare Workers AI y devuelve la respuesta como texto.
+ * Llama a un modelo de OpenRouter (NVIDIA Nemotron) como respaldo.
  */
-async function callLlama(env: Env, systemPrompt: string, history: {role: string, text: string}[]): Promise<string> {
-  let systemPromptLlama = systemPrompt + "\n\nREGLA ESTRICTA ADICIONAL: Eres un modelo de respaldo. TIENES ESTRICTAMENTE PROHIBIDO INVENTAR NOMBRES DE PRODUCTOS, MARCAS, LEYES O DATOS QUE NO ESTÉN EN LA BASE DE CONOCIMIENTO. Si la información no está, responde ÚNICAMENTE: 'No dispongo de esa información en mis registros, por favor contacte a un asesor humano.'";
-  if (systemPromptLlama.length > 6000) {
-    systemPromptLlama = systemPrompt.substring(0, 6000) + "\n\n[Contexto truncado por límites del modelo de respaldo]";
+async function callOpenRouter(env: Env, systemPrompt: string, history: {role: string, text: string}[]): Promise<string> {
+  if (!env.OPENROUTER_API_KEY) {
+    throw new Error("OPENROUTER_API_KEY no configurada");
   }
 
-  const llamaMessages = [
-    { role: "system", content: systemPromptLlama },
-    ...history.map((h, index) => {
-      let content = h.text;
-      // Inyectar recordatorio estricto al final del último mensaje del usuario para que Llama no lo ignore
-      if (index === history.length - 1 && h.role !== "model") {
-        content += "\n\n[RECORDATORIO OBLIGATORIO DEL SISTEMA: Usa siempre guiones (-) para listas, NUNCA asteriscos (*). TIENES ESTRICTAMENTE PROHIBIDO inventar datos, enlaces o sugerencias que no estén en tu base de conocimiento corporativa. Si no lo sabes, di 'No dispongo de esa información.']";
-      }
-      return {
-        role: h.role === "model" ? "assistant" : "user",
-        content: content
-      };
-    })
+  const model = "nvidia/nemotron-3-ultra-550b-a55b:free";
+
+  const orMessages = [
+    { role: "system", content: systemPrompt },
+    ...history.map(h => ({
+      role: h.role === "model" ? "assistant" : "user" as "user" | "assistant",
+      content: h.text
+    }))
   ];
 
-  const llamaRes = await env.AI.run("@cf/meta/llama-3.1-8b-instruct", {
-    messages: llamaMessages,
-    max_tokens: 1200,
-    temperature: 0.1
-  }) as any;
+  const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${env.OPENROUTER_API_KEY}`,
+      "Content-Type": "application/json",
+      "HTTP-Referer": "https://aizprua-assistant.arubel68.workers.dev",
+      "X-Title": "Aizprua S.E. Assistant"
+    },
+    body: JSON.stringify({
+      model,
+      messages: orMessages,
+      max_tokens: 1200,
+      temperature: 0.1
+    })
+  });
 
-  console.log("llamaRes output:", JSON.stringify(llamaRes));
-
-  let llamaAnswer = "";
-  if (typeof llamaRes === "string") {
-    llamaAnswer = llamaRes;
-  } else if (llamaRes && typeof llamaRes === "object") {
-    llamaAnswer = llamaRes.response || llamaRes.text || llamaRes.result?.response || "";
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`OpenRouter (${res.status}): ${errText}`);
   }
 
-  if (!llamaAnswer.trim()) {
-    throw new Error("Respuesta vacía de Llama 3");
+  const data = await res.json() as any;
+  const answer = data?.choices?.[0]?.message?.content;
+
+  if (!answer || !answer.trim()) {
+    throw new Error("Respuesta vacía de OpenRouter");
   }
 
-  return llamaAnswer;
+  return answer;
 }
 
 /**
@@ -898,10 +902,10 @@ async function alertAdmin(env: Env, errorType: string, errorMsg: string, query?:
 
   const emoji = errorType === "TOTAL_FAIL" ? "🔴" : "⚠️";
   const severity = errorType === "TOTAL_FAIL" ? "CRÍTICA" : "MEDIA";
-  const component = errorType === "GEMINI_FAIL" ? "Gemini 2.5 Flash" 
-                  : errorType === "LLAMA_FAIL" ? "Llama 3.1 Backup" 
+  const component = errorType === "GEMINI_FAIL" ? "Gemini" 
+                  : errorType === "OPENROUTER_FAIL" ? "OpenRouter (Nemotron)" 
                   : errorType === "SYNC_FAIL" ? "Sincronizador GitHub" 
-                  : "Sistema Completo (Ambos Modelos)";
+                  : "Sistema Completo";
 
   const dateStr = new Date().toISOString().replace('T', ' ').substring(0, 19) + ' UTC';
   
@@ -920,7 +924,7 @@ async function alertAdmin(env: Env, errorType: string, errorMsg: string, query?:
   alertMsg += `━━━━━━━━━━━━━━━━━━━━━━\n`;
   
   if (errorType === "GEMINI_FAIL") {
-    alertMsg += `⚙️ *Acción:* Se activó Llama 3.1 como respaldo automáticamente.`;
+    alertMsg += `⚙️ *Acción:* Se activó OpenRouter (Nemotron) como respaldo automáticamente.`;
   } else if (errorType === "TOTAL_FAIL") {
     alertMsg += `⚙️ *Acción:* Se envió mensaje de disculpa. Requiere revisión.`;
   } else if (errorType === "SYNC_FAIL") {
@@ -995,23 +999,37 @@ async function runSystemDiagnostics(env: Env): Promise<string> {
   }
   report += `🤖 *Gemini (${geminiModel}):* ${geminiStatus}\n`;
 
-  // 4. Validar Llama 3.1 Backup
-  let llamaStatus = "✅ Respondiendo";
-  try {
-    const llamaRes = await env.AI.run("@cf/meta/llama-3.1-8b-instruct", {
-      messages: [{ role: "user", content: "Hi" }],
-      max_tokens: 5
-    }) as any;
-    if (!llamaRes || (!llamaRes.response && !llamaRes.text)) {
-      throw new Error("Respuesta vacía");
-    }
-  } catch (err: any) {
-    llamaStatus = `⚠️ Error (${err.message || err})`;
-    if (overallStatus === "✅ Todo operativo") {
-      overallStatus = "⚠️ Backup no disponible";
+  // 4. Validar OpenRouter (Nemotron) Backup
+  let orStatus = env.OPENROUTER_API_KEY ? "⏳ Probando..." : "⏸️ No configurado";
+  if (env.OPENROUTER_API_KEY) {
+    try {
+      const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${env.OPENROUTER_API_KEY}`,
+          "Content-Type": "application/json",
+          "HTTP-Referer": "https://aizprua-assistant.arubel68.workers.dev",
+          "X-Title": "Aizprua S.E. Assistant"
+        },
+        body: JSON.stringify({
+          model: "nvidia/nemotron-3-ultra-550b-a55b:free",
+          messages: [{ role: "user", content: "Hi" }],
+          max_tokens: 5
+        })
+      });
+      if (!res.ok) {
+        const errText = await res.text();
+        throw new Error(`Status ${res.status}: ${errText}`);
+      }
+      orStatus = "✅ Respondiendo";
+    } catch (err: any) {
+      orStatus = `⚠️ Error (${err.message || err})`;
+      if (overallStatus === "✅ Todo operativo") {
+        overallStatus = "⚠️ Backup no disponible";
+      }
     }
   }
-  report += `🧠 *Llama 3.1 (Backup):* ${llamaStatus}\n`;
+  report += `🧠 *OpenRouter (Nemotron):* ${orStatus}\n`;
 
   // 5. Contar documentos
   try {
