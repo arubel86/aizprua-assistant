@@ -10,6 +10,22 @@ export interface Env {
   OPENROUTER_API_KEY?: string; // API key de OpenRouter (fallback alternativo a Gemini)
 }
 
+/**
+ * Limpia caracteres de markdown de un texto para enviarlo como texto plano.
+ */
+function cleanMarkdown(text: string): string {
+  return text
+    .replace(/^#+\s*/gm, '')
+    .replace(/\*\*(.+?)\*\*/g, '$1')
+    .replace(/__(.+?)__/g, '$1')
+    .replace(/\*(.+?)\*/g, '$1')
+    .replace(/_(.+?)_/g, '$1')
+    .replace(/`{1,3}[\s\S]*?`{1,3}/g, '')
+    .replace(/~~(.+?)~~/g, '$1')
+    .replace(/\[(.+?)\]\(.+?\)/g, '$1')
+    .trim();
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     // Si la petición no es POST, respondemos OK (puede ser un GET de prueba en navegador)
@@ -727,7 +743,7 @@ ${kbContext}`;
 
       history.push({ role: "model", text: answer });
       await saveChatHistory(env, chatId, history);
-      await sendTelegramMessage(env, chatId, `${answer}\n\n— 🤖 Gemini`);
+      await sendTelegramMessage(env, chatId, `${cleanMarkdown(answer)}\n\n— 🤖 Gemini`);
       return;
     } catch (err: any) {
       const geminiErrMsg = err.message || err;
@@ -751,7 +767,7 @@ ${kbContext}`;
 
       history.push({ role: "model", text: orAnswer });
       await saveChatHistory(env, chatId, history);
-      await sendTelegramMessage(env, chatId, `${orAnswer}\n\n— 🧠 OpenRouter (Nemotron)`);
+      await sendTelegramMessage(env, chatId, `${cleanMarkdown(orAnswer)}\n\n— 🧠 OpenRouter (Nemotron)`);
       return;
     } catch (fallbackErr: any) {
       console.error("Fallo en OpenRouter:", fallbackErr.message || fallbackErr);
@@ -766,7 +782,7 @@ ${kbContext}`;
 
       history.push({ role: "model", text: cfAnswer });
       await saveChatHistory(env, chatId, history);
-      await sendTelegramMessage(env, chatId, `${cfAnswer}\n\n— ☁️ Cloudflare AI (Llama)`);
+      await sendTelegramMessage(env, chatId, `${cleanMarkdown(cfAnswer)}\n\n— ☁️ Cloudflare AI (Llama)`);
       return;
     } catch (lastErr: any) {
       const lastErrMsg = lastErr.message || lastErr;
