@@ -706,7 +706,7 @@ ${kbContext}`;
 
       history.push({ role: "model", text: answer });
       await saveChatHistory(env, chatId, history);
-      await sendTelegramMessage(env, chatId, answer);
+      await sendTelegramMessage(env, chatId, `${answer}\n\n— 🤖 Gemini`);
       return;
     } catch (err: any) {
       const geminiErrMsg = err.message || err;
@@ -730,12 +730,7 @@ ${kbContext}`;
 
       history.push({ role: "model", text: orAnswer });
       await saveChatHistory(env, chatId, history);
-
-      if (activeModel === "auto") {
-        await sendTelegramMessage(env, chatId, `${orAnswer}\n\n*(Nota: Respuesta procesada por OpenRouter)*`);
-      } else {
-        await sendTelegramMessage(env, chatId, orAnswer);
-      }
+      await sendTelegramMessage(env, chatId, `${orAnswer}\n\n— 🧠 OpenRouter (Nemotron)`);
       return;
     } catch (fallbackErr: any) {
       console.error("Fallo en OpenRouter:", fallbackErr.message || fallbackErr);
@@ -750,9 +745,7 @@ ${kbContext}`;
 
       history.push({ role: "model", text: cfAnswer });
       await saveChatHistory(env, chatId, history);
-
-      const mark = activeModel === "auto" ? "\n\n*(Nota: Respuesta procesada por Cloudflare AI - último recurso)*" : "";
-      await sendTelegramMessage(env, chatId, `${cfAnswer}${mark}`);
+      await sendTelegramMessage(env, chatId, `${cfAnswer}\n\n— ☁️ Cloudflare AI (Llama)`);
       return;
     } catch (lastErr: any) {
       const lastErrMsg = lastErr.message || lastErr;
@@ -771,15 +764,12 @@ ${kbContext}`;
 
 /**
  * Llama al modelo Gemini y devuelve la respuesta como texto.
- * El modelo se configura via env.GEMINI_MODEL.
- * Fallback: gemini-2.5-flash-preview -> gemini-1.5-flash -> gemini-1.5-pro
+ * El modelo se configura via env.GEMINI_MODEL (default: gemini-2.5-flash).
  */
 async function callGemini(env: Env, systemPrompt: string, history: {role: string, text: string}[]): Promise<string> {
   const modelsToTry = [
     env.GEMINI_MODEL,
-    "gemini-2.5-flash-preview",
-    "gemini-1.5-flash",
-    "gemini-1.5-pro"
+    "gemini-2.5-flash"
   ].filter(Boolean) as string[];
 
   let lastError: Error | null = null;
@@ -1023,7 +1013,7 @@ async function runSystemDiagnostics(env: Env): Promise<string> {
   report += `🐙 *GitHub API:* ${githubStatus}\n`;
 
   // 3. Validar Gemini API
-  const geminiModel = env.GEMINI_MODEL || "gemini-2.5-flash-preview";
+  const geminiModel = env.GEMINI_MODEL || "gemini-2.5-flash";
   let geminiStatus = "✅ Respondiendo";
   try {
     const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=${env.GEMINI_API_KEY}`;
