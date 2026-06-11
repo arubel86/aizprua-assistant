@@ -1322,7 +1322,6 @@ function cosineSimilarity(vecA: number[], vecB: number[]): number {
 
 /**
  * Búsqueda clásica por palabras clave (fallback cuando no hay embeddings cacheados o suficientes coincidencias).
- * Optimizada para no descargar contenido de todos los archivos — primero filtra por nombre.
  */
 async function getRelevantContextKeywordFallback(env: Env, query: string, docKeys: string[]): Promise<{ context: string; images: string[] }> {
   const stopWords = new Set(["el", "la", "los", "las", "un", "una", "unos", "unas", "de", "del", "y", "o", "e", "u", "a", "en", "para", "por", "con", "sin", "sobre", "que", "es", "son", "se", "lo", "como", "cual", "cuales", "donde", "cuando", "quien", "cuanto", "cuantos"]);
@@ -1332,25 +1331,26 @@ async function getRelevantContextKeywordFallback(env: Env, query: string, docKey
     .split(/\s+/)
     .filter(word => word.length > 2 && !stopWords.has(word));
 
-  const nameMatched = docKeys.filter(key =>
+  // Fase 1: filtrar por nombre de archivo O nombre del directorio
+  const pathMatched = docKeys.filter(key =>
     key.endsWith("index.md") || keywords.some(kw => key.toLowerCase().includes(kw))
   );
 
-  let matchedDocs: { key: string; content: string }[] = [];
-  if (nameMatched.length > 0) {
-    const results = await Promise.all(nameMatched.map(async (key) => {
+  // Fase 2: descargar contenido de los archivos que coinciden por ruta (en paralelo)
+  let contentMatched: { key: string; content: string }[] = [];
+  if (pathMatched.length > 0) {
+    const results = await Promise.all(pathMatched.map(async (key) => {
       const content = await getFileContent(env, key);
       return { key, content: content || "" };
     }));
-    matchedDocs = results.filter(r => r.content);
+    const withContent = results.filter(r => r.content);
+    // Fase 3: verificar coincidencias en el contenido
+    contentMatched = withContent.filter(({ key, content }) =>
+      key.endsWith("index.md") || keywords.some(kw =>
+        key.toLowerCase().includes(kw) || content.toLowerCase().includes(kw)
+      )
+    );
   }
-
-  const contentMatched = matchedDocs.filter(({ key, content }) => {
-    if (key.endsWith("index.md")) return true;
-    const fileNameLower = key.toLowerCase();
-    if (keywords.some(kw => fileNameLower.includes(kw))) return true;
-    return keywords.some(kw => content.toLowerCase().includes(kw));
-  });
 
   let context = "";
   let includedKeys: string[] = [];
@@ -1362,17 +1362,42 @@ async function getRelevantContextKeywordFallback(env: Env, query: string, docKey
       includedKeys.push(key);
     }
   } else {
-    const limit = Math.min(docKeys.length, 8);
-    const defaultDocs = await Promise.all(docKeys.slice(0, limit).map(async (key) => {
-      const content = await getFileContent(env, key);
-      return { key, content: content || "" };
-    }));
+    // Fase 4: escanear contenido de TODOS los docs en lotes paralelos de 10
+    const allScanned: { key: string; content: string }[] = [];
+    for (let i = 0; i < docKeys.length && allScanned.length < 3; i += 10) {
+      const batch = docKeys.slice(i, i + 10);
+      const results = await Promise.all(batch.map(async (key) => {
+        const content = await getFileContent(env, key);
+        return { key, content: content || "" };
+      }));
+      for (const r of results) {
+        if (r.content && keywords.some(kw =>
+          r.key.toLowerCase().includes(kw) || r.content.toLowerCase().includes(kw)
+        )) {
+          allScanned.push(r);
+        }
+      }
+    }
 
-    for (const { key, content } of defaultDocs) {
-      if (content) {
+    if (allScanned.length > 1) {
+      for (const { key, content } of allScanned) {
         const fileNameClean = key.split('/').pop()?.replace('.md', '') || key;
         context += `\n--- Tema/Documento: ${fileNameClean} ---\n${content}\n`;
         includedKeys.push(key);
+      }
+    } else {
+      // Fase 5: si aún no hay suficientes, tomar los primeros 8 docs
+      const limit = Math.min(docKeys.length, 8);
+      const defaultDocs = await Promise.all(docKeys.slice(0, limit).map(async (key) => {
+        const content = await getFileContent(env, key);
+        return { key, content: content || "" };
+      }));
+      for (const { key, content } of defaultDocs) {
+        if (content) {
+          const fileNameClean = key.split('/').pop()?.replace('.md', '') || key;
+          context += `\n--- Tema/Documento: ${fileNameClean} ---\n${content}\n`;
+          includedKeys.push(key);
+        }
       }
     }
   }
