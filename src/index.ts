@@ -274,6 +274,52 @@ export default {
         return new Response("OK", { status: 200 });
       }
 
+      // Comando para diagnóstico de embeddings (solo admin)
+      if (text === "/embeddings") {
+        if (!isAdmin) {
+          await sendTelegramMessage(env, chatId, "Lo siento, no tienes permisos de administrador. ❌");
+          return new Response("OK", { status: 200 });
+        }
+
+        const list = await env.AIZPRUA_WIKI_KV.get("_file_list");
+        if (!list) {
+          await sendTelegramMessage(env, chatId, "La base de conocimiento no está sincronizada. ❌");
+          return new Response("OK", { status: 200 });
+        }
+
+        const files: string[] = JSON.parse(list);
+        let embeddedCount = 0;
+        let missingCount = 0;
+        const missingList: string[] = [];
+
+        for (const file of files) {
+          const emb = await env.AIZPRUA_WIKI_KV.get(`embedding:${file}`);
+          if (emb) {
+            embeddedCount++;
+          } else {
+            missingCount++;
+            missingList.push(file);
+          }
+        }
+
+        let report = `📊 *Estado de Embeddings (Caché KV)*\n`;
+        report += `━━━━━━━━━━━━━━━━━━━━━━\n`;
+        report += `📄 Total archivos: ${files.length}\n`;
+        report += `✅ Con vector: ${embeddedCount}\n`;
+        report += `❌ Sin vector: ${missingCount}\n`;
+        report += `━━━━━━━━━━━━━━━━━━━━━━\n`;
+        if (missingList.length > 0) {
+          report += `*Archivos pendientes:*\n`;
+          report += missingList.slice(0, 10).map(f => `• \`${f.split('/').pop()}\``).join("\n");
+          if (missingList.length > 10) {
+            report += `\n... y ${missingList.length - 10} más.`;
+          }
+        }
+
+        await sendTelegramMessage(env, chatId, report);
+        return new Response("OK", { status: 200 });
+      }
+
       // Procesar preguntas del negocio
       await handleUserQuery(env, chatId, text);
 
@@ -365,8 +411,14 @@ function extractImages(content: string, docPath: string): string[] {
       const dir = docPath.includes("/") ? docPath.substring(0, docPath.lastIndexOf("/")) : "";
       const cleanPath = imgUrl.replace(/^\.\//, "").replace(/^\.\.\//, "");
       const resolvedPath = dir ? `${dir}/${cleanPath}` : cleanPath;
-      // Codificar cada segmento por separado para no doble-codificar %20 ni codificar /
-      const encoded = resolvedPath.split("/").map(s => encodeURIComponent(s)).join("/");
+      // Codificar cada segmento por separado, previniendo la doble-codificación (ej: %20 -> %2520)
+      const encoded = resolvedPath.split("/").map(s => {
+        try {
+          return encodeURIComponent(decodeURIComponent(s));
+        } catch(e) {
+          return encodeURIComponent(s);
+        }
+      }).join("/");
       imgUrl = `${GITHUB_RAW_BASE}/${encoded}`;
     }
     urls.push(imgUrl);
@@ -416,7 +468,8 @@ async function getFileContent(env: Env, path: string): Promise<string | null> {
   if (cached !== null) return cached;
 
   // Descargar desde GitHub y cachear
-  const url = `https://raw.githubusercontent.com/arubel86/Aizpruase-Documentos-Tramites/main/${encodeURIComponent(path)}`;
+  const encodedPath = path.split("/").map(segment => encodeURIComponent(segment)).join("/");
+  const url = `https://raw.githubusercontent.com/arubel86/Aizpruase-Documentos-Tramites/main/${encodedPath}`;
   const res = await fetch(url, {
     headers: {
       "Authorization": `token ${env.GITHUB_TOKEN}`,
@@ -492,13 +545,52 @@ async function syncGitHubWiki(env: Env, chatId: number): Promise<void> {
     filesList.push(item.path);
   }
 
-  // 4. Guardar la lista de archivos en KV
+  // 4. Guardar la lista de archivos en KV, limpiando antes los contenidos cacheados de la lista anterior (Mejora D)
+  const oldFileListStr = await env.AIZPRUA_WIKI_KV.get("_file_list");
+  if (oldFileListStr) {
+    try {
+      const oldFileList = JSON.parse(oldFileListStr) as string[];
+      for (const oldFile of oldFileList) {
+        await env.AIZPRUA_WIKI_KV.delete(oldFile);
+      }
+    } catch (e) {
+      console.error("Error al limpiar archivos cacheados viejos:", e);
+    }
+  }
   await env.AIZPRUA_WIKI_KV.put("_file_list", JSON.stringify(filesList));
+
+  // Limpiar embeddings antiguos del modelo en inglés con paginación (Mejora G)
+  let cursor: string | undefined = undefined;
+  do {
+    const listEmbeds: any = await env.AIZPRUA_WIKI_KV.list({ prefix: "embedding:", cursor });
+    for (const key of listEmbeds.keys) {
+      await env.AIZPRUA_WIKI_KV.delete(key.name);
+    }
+    cursor = listEmbeds.list_complete ? undefined : listEmbeds.cursor;
+  } while (cursor);
+
+  // Generar embeddings de forma proactiva para los primeros 10 documentos en segundo plano para evitar latencia inicial, con try-catch individual (Mejora F)
+  let generatedCount = 0;
+  const initialBatch = filesList.slice(0, 10);
+  for (const key of initialBatch) {
+    try {
+      const content = await getFileContent(env, key);
+      if (content) {
+        const embedding = await generateEmbedding(env, content);
+        if (embedding) {
+          await env.AIZPRUA_WIKI_KV.put(`embedding:${key}`, JSON.stringify(embedding));
+          generatedCount++;
+        }
+      }
+    } catch (err) {
+      console.error(`Error al pre-generar embedding para ${key}:`, err);
+    }
+  }
 
   await sendTelegramMessage(
     env,
     chatId,
-    `✅ *Sincronización completada* 📚\n━━━━━━━━━━━━━━━━━━━━━━\n📄 Archivos .md encontrados en GitHub: ${filesList.length}\n📋 Lista guardada en KV\n━━━━━━━━━━━━━━━━━━━━━━\nLos contenidos se descargan bajo demanda cuando haces consultas.`
+    `✅ *Sincronización completada* 📚\n━━━━━━━━━━━━━━━━━━━━━━\n📄 Archivos .md encontrados: ${filesList.length}\n✅ Embeddings regenerados: ${generatedCount} / ${initialBatch.length} (lote inicial)\n📋 Lista guardada en KV\n━━━━━━━━━━━━━━━━━━━━━━\nLos contenidos restantes se procesan bajo demanda.`
   );
 }
 
@@ -597,7 +689,7 @@ async function computeHMACSHA256(secret: string, body: string): Promise<string> 
  * Filtra y devuelve únicamente los documentos relevantes de la base de conocimiento en base a las palabras clave de la pregunta.
  * Esto optimiza el consumo de tokens y evita desbordar el contexto de la IA.
  */
-async function getRelevantContext(env: Env, query: string, docKeys: string[]): Promise<{ context: string; images: string[] }> {
+async function getRelevantContext(env: Env, query: string, docKeys: string[]): Promise<{ context: string; images: string[]; sourceDocNames: string[] }> {
   let queryVector: number[] | null = null;
   try {
     queryVector = await generateEmbedding(env, query);
@@ -639,20 +731,20 @@ async function getRelevantContext(env: Env, query: string, docKeys: string[]): P
 
   similarities.sort((a, b) => b.similarity - a.similarity);
 
-  const topDocs = similarities.slice(0, 8);
+  const topDocs = similarities.slice(0, 12);
 
   let context = "";
   let filesIncluded = 0;
-  const includedKeys: string[] = [];
+  const includedDocs: { key: string; content: string; similarity: number }[] = [];
 
   for (const item of topDocs) {
-    if (item.similarity > 0.25) {
+    if (item.similarity > 0.15) {
       const fileContent = await getFileContent(env, item.key);
       if (fileContent) {
         const fileNameClean = item.key.split('/').pop()?.replace('.md', '') || item.key;
         context += `\n--- Tema/Documento: ${fileNameClean} (Similitud: ${(item.similarity * 100).toFixed(1)}%) ---\n${fileContent}\n`;
         filesIncluded++;
-        includedKeys.push(item.key);
+        includedDocs.push({ key: item.key, content: fileContent, similarity: item.similarity });
       }
     }
   }
@@ -661,13 +753,10 @@ async function getRelevantContext(env: Env, query: string, docKeys: string[]): P
     return getRelevantContextKeywordFallback(env, query, docKeys);
   }
 
-  // Extraer imágenes de los documentos incluidos
+  // Extraer imágenes de los documentos incluidos sin volver a leer de KV (Mejora C)
   const images: string[] = [];
-  for (const key of includedKeys) {
-    const content = await getFileContent(env, key);
-    if (content) {
-      images.push(...extractImages(content, key));
-    }
+  for (const doc of includedDocs) {
+    images.push(...extractImages(doc.content, doc.key));
   }
 
   if (missingEmbeds.length > 0) {
@@ -691,7 +780,13 @@ async function getRelevantContext(env: Env, query: string, docKeys: string[]): P
     }
   }
 
-  return { context, images };
+  // Explicación Racional: El modelo bge-m3 produce similitudes altas para muchos documentos,
+  // por lo que un umbral fijo no filtra eficazmente. Tomamos solo los 3 documentos con mayor
+  // similitud para el footer (ya vienen ordenados descendente por topDocs.sort), mientras que
+  // la IA sigue usando todos los documentos incluidos como contexto completo para responder.
+  const sourceDocNames = includedDocs.slice(0, 3).map(doc => doc.key.split('/').pop()?.replace('.md', '') || doc.key);
+
+  return { context, images, sourceDocNames };
 }
 
 /**
@@ -735,6 +830,108 @@ async function saveChatHistory(env: Env, chatId: number, history: {role: "user" 
   await env.AIZPRUA_WIKI_KV.put(historyKey, JSON.stringify(history), { expirationTtl: 1800 });
 }
 
+/**
+ * Genera el pie de página programático con fuentes y modelo de IA de forma consistente y limpia.
+ */
+function formatTelegramFooter(fuentes: string[], modelo: string): string {
+  let fuentesText = "Búsqueda general";
+  if (fuentes && fuentes.length > 0) {
+    const unique = Array.from(new Set(fuentes)).filter(Boolean);
+    if (unique.length > 0) {
+      // Explicación Racional: Reemplazamos todos los guiones bajos por espacios en el
+      // nombre de los archivos mostrados en el pie de página para mejorar la presentación estética.
+      fuentesText = unique.map(f => f.replace(/_/g, " ")).join(", ");
+    }
+  }
+  return `\n\n━━━━━━━━━━━━━━━━━━━━━━\n📂 Fuentes: ${fuentesText}\n🤖 Modelo: ${modelo}`;
+}
+
+/**
+ * Explicación Racional: Normaliza y mapea la citación de texto plano generada por la IA
+ * (por ejemplo, "Información General de la Empresa") con el archivo físico real en el KV (ej. "Informacion_Empresa").
+ * Esto vincula la citación semántica con el archivo real y evita listar fuentes erróneas.
+ */
+function findMatchingDocs(citedText: string, allDocKeys: string[]): string[] {
+  const cleanDocs = allDocKeys.map(k => {
+    const base = k.split('/').pop()?.replace('.md', '') || k;
+    return { 
+      original: base, 
+      normalized: normalizeText(base).replace(/[^a-z0-9]/g, "") 
+    };
+  });
+  
+  if (!cleanDocs.some(d => d.original === "Informacion_Empresa")) {
+    cleanDocs.push({ original: "Informacion_Empresa", normalized: "informacionempresa" });
+  }
+
+  const normalizedCited = normalizeText(citedText).replace(/[^a-z0-9]/g, "");
+  
+  const matches: string[] = [];
+  for (const doc of cleanDocs) {
+    if (normalizedCited.includes(doc.normalized) || doc.normalized.includes(normalizedCited)) {
+      matches.push(doc.original);
+    }
+  }
+
+  if (matches.length === 0) {
+    const citedWords = normalizeText(citedText)
+      .replace(/[^a-z0-9\s]/g, "")
+      .split(/\s+/)
+      .filter(w => w.length > 2);
+    
+    for (const doc of cleanDocs) {
+      const docWords = doc.original.toLowerCase().split(/[^a-z0-9]/).filter(w => w.length > 2);
+      const hasOverlap = docWords.length > 0 && docWords.every(dw => citedWords.includes(dw));
+      if (hasOverlap) {
+        matches.push(doc.original);
+      }
+    }
+  }
+
+  if (matches.length === 0) {
+    return [citedText.trim()];
+  }
+
+  return Array.from(new Set(matches));
+}
+
+/**
+ * Explicación Racional: Extrae la línea "Fuente: ..." de la respuesta de la IA usando una regex
+ * de fin de línea, mapea la citación al documento físico real, y remueve dicha línea del cuerpo
+ * del mensaje para que la citación no aparezca duplicada y se muestre únicamente en el pie de página.
+ */
+function cleanAnswerAndExtractFuentes(answer: string, allDocKeys: string[]): { cleanAnswer: string; fuentes: string[] } {
+  // Captura case-insensitive "Fuente:" o "Fuentes:" y todo el contenido hasta el final de la línea.
+  const regex = /(?:\r?\n)*Fuente[s]?:\s*([^\n\r]+)/i;
+  const match = answer.match(regex);
+  
+  let fuentes: string[] = [];
+  let cleanAnswer = answer;
+  
+  if (match) {
+    let rawCited = match[1].trim();
+    if (rawCited.endsWith(".")) {
+      rawCited = rawCited.slice(0, -1);
+    }
+    
+    const parts = rawCited.split(/,|\s+y\s+|\s+o\s+|\/|&/);
+    const detectedSources: string[] = [];
+
+    for (const p of parts) {
+      const cleanP = p.trim();
+      if (!cleanP) continue;
+      
+      const matched = findMatchingDocs(cleanP, allDocKeys);
+      detectedSources.push(...matched);
+    }
+    
+    fuentes = Array.from(new Set(detectedSources));
+    cleanAnswer = answer.replace(regex, "").trim();
+  }
+  
+  return { cleanAnswer, fuentes };
+}
+
   /**
    * Lee la base de conocimiento desde Cloudflare KV, arma el contexto y llama al modelo de IA configurado.
    * Soporta 3 modos: 'auto' (Gemini → OpenRouter → Cloudflare AI), 'gemini' (forzado) y 'llama' (forzado).
@@ -771,14 +968,26 @@ async function handleUserQuery(env: Env, chatId: number, query: string): Promise
   const allDocKeys: string[] = JSON.parse(fileListStr);
 
   // 2. Obtener contexto optimizado y filtrado
-  const { context: kbContext, images: kbImages } = await getRelevantContext(env, query, allDocKeys);
+  let { context: kbContext, images: kbImages, sourceDocNames } = await getRelevantContext(env, query, allDocKeys);
+
+  // Agregar información general de la empresa de forma fija y permanente al contexto
+  const infoEmpresa = await getFileContent(env, "Informacion_Empresa.md");
+  if (infoEmpresa) {
+    kbContext = `--- Información General de la Empresa ---\n${infoEmpresa}\n━━━━━━━━━━━━━━━━━━━━━━\n` + kbContext;
+  }
 
   // 3. Prompt de sistema con las reglas de Aizprua S.E.
+  // Explicación Racional: Inyectamos dinámicamente los nombres de las imágenes encontradas
+  // para que la IA sepa qué imágenes exactas adjuntará el sistema y no diga que "no puede verlas".
+  const imagenesDisponibles = kbImages.length > 0 
+    ? kbImages.map((img, i) => `- ${img.split('/').pop()?.replace(/%20/g, ' ')}`).join('\n') 
+    : 'No hay imágenes adicionales asociadas a esta consulta.';
+
   const systemPrompt = `Eres el asistente virtual oficial de "Aizprua S.E." (Aizprua Servicios Especiales). Tu comportamiento debe ser sumamente profesional, respetuoso y formal.
 
 INSTRUCCIÓN CRÍTICA DE SEGURIDAD:
 Tu conocimiento está estrictamente limitado a la información contenida en la "Base de conocimiento de la empresa" provista abajo.
-- Si la información o respuesta a la pregunta del usuario NO está detallada explícitamente en la base de conocimiento, debes responder formalmente indicando que no dispones de ese detalle en tus registros y sugerir contactar a un asesor humano.
+- Si la información o respuesta a la pregunta del usuario NO está detallada explícitamente en la base de conocimiento, debes responder formalmente indicando que no dispones de ese detalle en tus registros y sugerir contactar a un asesor humano al 6546-1527.
 - Está terminantemente PROHIBIDO inventar, asumir, deducir o especular sobre cualquier dato (precios, leyes, requisitos, nombres, etc.) que no figure textualmente en los documentos provistos.
 
 Directrices de comunicación y formato:
@@ -786,8 +995,12 @@ Directrices de comunicación y formato:
 2. NO use ningún tipo de formato markdown ni caracteres especiales de formato. No use asteriscos, numerales, backticks, corchetes, guiones bajos ni ningún otro símbolo de markup. Escriba únicamente en texto plano.
 3. Use texto plano limpio y bien estructurado con sangrías, viñetas con guiones (-), numeración (1., 2., etc.) y párrafos separados por línea en blanco.
 4. Cuide la ortografía, los puntos y comas, los espacios y la gramática en general. Cada oración debe comenzar con mayúscula y terminar con punto.
-5. Las imágenes de productos (equipos POS, facturadores, etc.) que aparecen en los documentos se enviarán automáticamente después del texto. No diga que no puede mostrar imágenes, simplemente menciónelas si aparecen en el contexto.
+5. MANEJO DE IMÁGENES: El sistema enviará automáticamente las imágenes disponibles listadas abajo junto con tu respuesta. Si el usuario pregunta por fotos, catálogo o imágenes, asume que SÍ las está viendo en pantalla. Bajo NINGUNA circunstancia digas "no puedo mostrar imágenes", "soy una IA de texto" o te disculpes por ello. Si hay imágenes, invítalo a revisar los archivos adjuntos a tu mensaje.
 6. Evite el uso excesivo de emojis (use máximo uno o dos solo si es pertinente para facilitar la lectura).
+7. REGLA DE CITACIÓN: Al final de tu respuesta, menciona de qué documento de la base de conocimiento obtuviste la información principal (ejemplo: "Fuente: Servicios Individuales"). Si no encontraste información específica en el contexto, di textualmente: "No dispongo de esa información en mis registros. Le sugiero contactar a un asesor al 6546-1527."
+
+Imágenes que el sistema adjuntará automáticamente a tu respuesta (Trátalas como visibles para el usuario):
+${imagenesDisponibles}
 
 Base de conocimiento de la empresa:
 ${kbContext}`;
@@ -822,9 +1035,16 @@ ${kbContext}`;
         await env.AIZPRUA_WIKI_KV.delete("gemini_cooldown");
       }
 
-      history.push({ role: "model", text: answer });
+      // Explicación Racional: Filtramos el texto de respuesta para extraer la fuente real,
+      // la mapeamos con findMatchingDocs y removemos el bloque "Fuente: ..." original
+      // para evitar duplicación. Guardamos la versión limpia en el historial.
+      const { cleanAnswer, fuentes } = cleanAnswerAndExtractFuentes(answer, allDocKeys);
+      const finalFuentes = fuentes.length > 0 ? fuentes : sourceDocNames;
+
+      history.push({ role: "model", text: cleanAnswer });
       await saveChatHistory(env, chatId, history);
-      await sendTelegramMessagePlain(env, chatId, `${answer}\n\n- Gemini`);
+      const footerText = formatTelegramFooter(finalFuentes, "Gemini");
+      await sendTelegramMessagePlain(env, chatId, `${cleanAnswer}${footerText}`);
       for (const imgUrl of kbImages.slice(0, 5)) {
         await sendTelegramPhoto(env, chatId, imgUrl);
       }
@@ -849,9 +1069,13 @@ ${kbContext}`;
     try {
       const orAnswer = await callOpenRouter(env, systemPrompt, history);
 
-      history.push({ role: "model", text: orAnswer });
+      const { cleanAnswer: cleanOrAnswer, fuentes: orFuentes } = cleanAnswerAndExtractFuentes(orAnswer, allDocKeys);
+      const finalOrFuentes = orFuentes.length > 0 ? orFuentes : sourceDocNames;
+
+      history.push({ role: "model", text: cleanOrAnswer });
       await saveChatHistory(env, chatId, history);
-      await sendTelegramMessagePlain(env, chatId, `${orAnswer}\n\n- OpenRouter (Nemotron)`);
+      const footerText = formatTelegramFooter(finalOrFuentes, "OpenRouter (Nemotron)");
+      await sendTelegramMessagePlain(env, chatId, `${cleanOrAnswer}${footerText}`);
       for (const imgUrl of kbImages.slice(0, 5)) {
         await sendTelegramPhoto(env, chatId, imgUrl);
       }
@@ -867,9 +1091,13 @@ ${kbContext}`;
     try {
       const cfAnswer = await callCloudflareAI(env, systemPrompt, history);
 
-      history.push({ role: "model", text: cfAnswer });
+      const { cleanAnswer: cleanCfAnswer, fuentes: cfFuentes } = cleanAnswerAndExtractFuentes(cfAnswer, allDocKeys);
+      const finalCfFuentes = cfFuentes.length > 0 ? cfFuentes : sourceDocNames;
+
+      history.push({ role: "model", text: cleanCfAnswer });
       await saveChatHistory(env, chatId, history);
-      await sendTelegramMessagePlain(env, chatId, `${cfAnswer}\n\n- Cloudflare AI (Llama)`);
+      const footerText = formatTelegramFooter(finalCfFuentes, "Cloudflare AI (Llama)");
+      await sendTelegramMessagePlain(env, chatId, `${cleanCfAnswer}${footerText}`);
       for (const imgUrl of kbImages.slice(0, 5)) {
         await sendTelegramPhoto(env, chatId, imgUrl);
       }
@@ -1260,26 +1488,7 @@ function splitText(text: string, maxLength: number = 4000): string[] {
   return chunks;
 }
 
-/**
- * Envía la acción de chat de tipo "typing" a la API de Telegram.
- */
-async function sendTelegramTyping(env: Env, chatId: number): Promise<void> {
-  const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendChatAction`;
-  try {
-    await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        chat_id: chatId,
-        action: "typing"
-      })
-    });
-  } catch (err) {
-    console.error("Error al enviar chat action de Telegram:", err);
-  }
-}
+
 
 /**
  * Genera el vector de embedding para un texto dado utilizando Workers AI de Cloudflare.
@@ -1290,7 +1499,7 @@ async function generateEmbedding(env: Env, text: string): Promise<number[] | nul
   const cleanText = text.substring(0, 2000).replace(/\r?\n/g, " ").trim();
   if (!cleanText) return null;
   
-  const response = await env.AI.run("@cf/baai/bge-base-en-v1.5", {
+  const response = await env.AI.run("@cf/baai/bge-m3", {
     text: [cleanText]
   }) as any;
   
@@ -1305,9 +1514,10 @@ async function generateEmbedding(env: Env, text: string): Promise<number[] | nul
 }
 
 /**
- * Calcula la similitud de coseno entre dos vectores numéricos.
+ * Calcula la similitud de coseno entre dos vectores numéricos, validando dimensiones (Mejora A).
  */
 function cosineSimilarity(vecA: number[], vecB: number[]): number {
+  if (vecA.length !== vecB.length) return 0;
   let dotProduct = 0;
   let normA = 0;
   let normB = 0;
@@ -1321,19 +1531,30 @@ function cosineSimilarity(vecA: number[], vecB: number[]): number {
 }
 
 /**
+ * Normaliza texto eliminando acentos y diacríticos para comparación insensible (Mejora I).
+ */
+function normalizeText(text: string): string {
+  return text
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, ""); // Remueve tildes y diacríticos
+}
+
+/**
  * Búsqueda clásica por palabras clave (fallback cuando no hay embeddings cacheados o suficientes coincidencias).
  */
-async function getRelevantContextKeywordFallback(env: Env, query: string, docKeys: string[]): Promise<{ context: string; images: string[] }> {
+async function getRelevantContextKeywordFallback(env: Env, query: string, docKeys: string[]): Promise<{ context: string; images: string[]; sourceDocNames: string[] }> {
   const stopWords = new Set(["el", "la", "los", "las", "un", "una", "unos", "unas", "de", "del", "y", "o", "e", "u", "a", "en", "para", "por", "con", "sin", "sobre", "que", "es", "son", "se", "lo", "como", "cual", "cuales", "donde", "cuando", "quien", "cuanto", "cuantos"]);
 
-  const keywords = query.toLowerCase()
+  const normalizedQuery = normalizeText(query);
+  const keywords = normalizedQuery
     .replace(/[¿?¡!.,;:#()]/g, "")
     .split(/\s+/)
     .filter(word => word.length > 2 && !stopWords.has(word));
 
   // Fase 1: filtrar por nombre de archivo O nombre del directorio
   const pathMatched = docKeys.filter(key =>
-    key.endsWith("index.md") || keywords.some(kw => key.toLowerCase().includes(kw))
+    key.endsWith("index.md") || keywords.some(kw => normalizeText(key).includes(kw))
   );
 
   // Fase 2: descargar contenido de los archivos que coinciden por ruta (en paralelo)
@@ -1347,24 +1568,24 @@ async function getRelevantContextKeywordFallback(env: Env, query: string, docKey
     // Fase 3: verificar coincidencias en el contenido
     contentMatched = withContent.filter(({ key, content }) =>
       key.endsWith("index.md") || keywords.some(kw =>
-        key.toLowerCase().includes(kw) || content.toLowerCase().includes(kw)
+        normalizeText(key).includes(kw) || normalizeText(content).includes(kw)
       )
     );
   }
 
   let context = "";
-  let includedKeys: string[] = [];
+  const includedDocs: { key: string; content: string }[] = [];
 
-  if (contentMatched.length > 1) {
+  if (contentMatched.length >= 1) {
     for (const { key, content } of contentMatched) {
       const fileNameClean = key.split('/').pop()?.replace('.md', '') || key;
       context += `\n--- Tema/Documento: ${fileNameClean} ---\n${content}\n`;
-      includedKeys.push(key);
+      includedDocs.push({ key, content });
     }
   } else {
-    // Fase 4: escanear contenido de TODOS los docs en lotes paralelos de 10
+    // Fase 4: escanear contenido de TODOS los docs en lotes paralelos de 10 (Mejora E: límite a < 5)
     const allScanned: { key: string; content: string }[] = [];
-    for (let i = 0; i < docKeys.length && allScanned.length < 3; i += 10) {
+    for (let i = 0; i < docKeys.length && allScanned.length < 5; i += 10) {
       const batch = docKeys.slice(i, i + 10);
       const results = await Promise.all(batch.map(async (key) => {
         const content = await getFileContent(env, key);
@@ -1372,43 +1593,32 @@ async function getRelevantContextKeywordFallback(env: Env, query: string, docKey
       }));
       for (const r of results) {
         if (r.content && keywords.some(kw =>
-          r.key.toLowerCase().includes(kw) || r.content.toLowerCase().includes(kw)
+          normalizeText(r.key).includes(kw) || normalizeText(r.content).includes(kw)
         )) {
           allScanned.push(r);
         }
       }
     }
 
-    if (allScanned.length > 1) {
+    if (allScanned.length >= 1) {
       for (const { key, content } of allScanned) {
         const fileNameClean = key.split('/').pop()?.replace('.md', '') || key;
         context += `\n--- Tema/Documento: ${fileNameClean} ---\n${content}\n`;
-        includedKeys.push(key);
+        includedDocs.push({ key, content });
       }
     } else {
-      // Fase 5: si aún no hay suficientes, tomar los primeros 8 docs
-      const limit = Math.min(docKeys.length, 8);
-      const defaultDocs = await Promise.all(docKeys.slice(0, limit).map(async (key) => {
-        const content = await getFileContent(env, key);
-        return { key, content: content || "" };
-      }));
-      for (const { key, content } of defaultDocs) {
-        if (content) {
-          const fileNameClean = key.split('/').pop()?.replace('.md', '') || key;
-          context += `\n--- Tema/Documento: ${fileNameClean} ---\n${content}\n`;
-          includedKeys.push(key);
-        }
-      }
+      // Fase 5: No cargar documentos aleatorios si no hay coincidencia
+      context += `\n[NO SE ENCONTRARON DOCUMENTOS RELEVANTES PARA ESTA CONSULTA EN LA BASE DE CONOCIMIENTO]\n`;
     }
   }
 
+  // Extraer imágenes de los documentos incluidos sin volver a leer de KV (Mejora C)
   const images: string[] = [];
-  for (const key of includedKeys) {
-    const content = await getFileContent(env, key);
-    if (content) {
-      images.push(...extractImages(content, key));
-    }
+  for (const doc of includedDocs) {
+    images.push(...extractImages(doc.content, doc.key));
   }
 
-  return { context, images };
+  const sourceDocNames = includedDocs.slice(0, 3).map(doc => doc.key.split('/').pop()?.replace('.md', '') || doc.key);
+
+  return { context, images, sourceDocNames };
 }
