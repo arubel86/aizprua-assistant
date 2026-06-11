@@ -335,11 +335,19 @@ async function sendTelegramMessagePlain(env: Env, chatId: number, text: string):
  */
 async function sendTelegramPhoto(env: Env, chatId: number, photoUrl: string): Promise<void> {
   const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendPhoto`;
-  await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, photo: photoUrl })
-  });
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, photo: photoUrl })
+    });
+    if (!res.ok) {
+      const errText = await res.text();
+      console.error(`Error enviando foto ${photoUrl}: ${errText}`);
+    }
+  } catch (err) {
+    console.error(`Error al enviar foto ${photoUrl}:`, err);
+  }
 }
 
 const GITHUB_RAW_BASE = "https://raw.githubusercontent.com/arubel86/Aizpruase-Documentos-Tramites/main";
@@ -353,11 +361,13 @@ function extractImages(content: string, docPath: string): string[] {
   let match;
   while ((match = regex.exec(content)) !== null) {
     let imgUrl = match[1];
-    // Resolver rutas relativas
     if (imgUrl.startsWith("./") || imgUrl.startsWith("../") || !imgUrl.startsWith("http")) {
       const dir = docPath.includes("/") ? docPath.substring(0, docPath.lastIndexOf("/")) : "";
-      const resolvedPath = dir ? `${dir}/${imgUrl.replace(/^\.\//, "")}` : imgUrl.replace(/^\.\//, "");
-      imgUrl = `${GITHUB_RAW_BASE}/${encodeURIComponent(resolvedPath)}`;
+      const cleanPath = imgUrl.replace(/^\.\//, "").replace(/^\.\.\//, "");
+      const resolvedPath = dir ? `${dir}/${cleanPath}` : cleanPath;
+      // Codificar cada segmento por separado para no doble-codificar %20 ni codificar /
+      const encoded = resolvedPath.split("/").map(s => encodeURIComponent(s)).join("/");
+      imgUrl = `${GITHUB_RAW_BASE}/${encoded}`;
     }
     urls.push(imgUrl);
   }
@@ -776,7 +786,7 @@ Directrices de comunicación y formato:
 2. NO use ningún tipo de formato markdown ni caracteres especiales de formato. No use asteriscos, numerales, backticks, corchetes, guiones bajos ni ningún otro símbolo de markup. Escriba únicamente en texto plano.
 3. Use texto plano limpio y bien estructurado con sangrías, viñetas con guiones (-), numeración (1., 2., etc.) y párrafos separados por línea en blanco.
 4. Cuide la ortografía, los puntos y comas, los espacios y la gramática en general. Cada oración debe comenzar con mayúscula y terminar con punto.
-5. Si el usuario pregunta precios o paquetes de servicio, limítese estrictamente a lo indicado en los documentos de paquetes.
+5. Las imágenes de productos (equipos POS, facturadores, etc.) que aparecen en los documentos se enviarán automáticamente después del texto. No diga que no puede mostrar imágenes, simplemente menciónelas si aparecen en el contexto.
 6. Evite el uso excesivo de emojis (use máximo uno o dos solo si es pertinente para facilitar la lectura).
 
 Base de conocimiento de la empresa:
