@@ -331,6 +331,40 @@ async function sendTelegramMessagePlain(env: Env, chatId: number, text: string):
 }
 
 /**
+ * Envía una foto a Telegram desde una URL.
+ */
+async function sendTelegramPhoto(env: Env, chatId: number, photoUrl: string): Promise<void> {
+  const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendPhoto`;
+  await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, photo: photoUrl })
+  });
+}
+
+const GITHUB_RAW_BASE = "https://raw.githubusercontent.com/arubel86/Aizpruase-Documentos-Tramites/main";
+
+/**
+ * Extrae URLs de imágenes ![](...) del contenido markdown y las resuelve a URLs absolutas de GitHub raw.
+ */
+function extractImages(content: string, docPath: string): string[] {
+  const urls: string[] = [];
+  const regex = /!\[.*?\]\(([^)]+)\)/g;
+  let match;
+  while ((match = regex.exec(content)) !== null) {
+    let imgUrl = match[1];
+    // Resolver rutas relativas
+    if (imgUrl.startsWith("./") || imgUrl.startsWith("../") || !imgUrl.startsWith("http")) {
+      const dir = docPath.includes("/") ? docPath.substring(0, docPath.lastIndexOf("/")) : "";
+      const resolvedPath = dir ? `${dir}/${imgUrl.replace(/^\.\//, "")}` : imgUrl.replace(/^\.\//, "");
+      imgUrl = `${GITHUB_RAW_BASE}/${encodeURIComponent(resolvedPath)}`;
+    }
+    urls.push(imgUrl);
+  }
+  return urls;
+}
+
+/**
  * Helper interno para enviar un único mensaje a Telegram.
  */
 async function sendSingleTelegramMessage(env: Env, chatId: number, text: string): Promise<void> {
@@ -553,7 +587,7 @@ async function computeHMACSHA256(secret: string, body: string): Promise<string> 
  * Filtra y devuelve únicamente los documentos relevantes de la base de conocimiento en base a las palabras clave de la pregunta.
  * Esto optimiza el consumo de tokens y evita desbordar el contexto de la IA.
  */
-async function getRelevantContext(env: Env, query: string, docKeys: string[]): Promise<string> {
+async function getRelevantContext(env: Env, query: string, docKeys: string[]): Promise<{ context: string; images: string[] }> {
   let queryVector: number[] | null = null;
   try {
     queryVector = await generateEmbedding(env, query);
@@ -565,7 +599,6 @@ async function getRelevantContext(env: Env, query: string, docKeys: string[]): P
     return getRelevantContextKeywordFallback(env, query, docKeys);
   }
 
-  // Solo usar embeddings ya cacheados (no generar en caliente)
   const similarities: { key: string; similarity: number }[] = [];
   const missingEmbeds: string[] = [];
 
@@ -594,14 +627,13 @@ async function getRelevantContext(env: Env, query: string, docKeys: string[]): P
     }
   }
 
-  // Ordenar de mayor a menor similitud
   similarities.sort((a, b) => b.similarity - a.similarity);
 
-  // Seleccionar los mejores 8 documentos
   const topDocs = similarities.slice(0, 8);
 
   let context = "";
   let filesIncluded = 0;
+  const includedKeys: string[] = [];
 
   for (const item of topDocs) {
     if (item.similarity > 0.25) {
@@ -610,17 +642,24 @@ async function getRelevantContext(env: Env, query: string, docKeys: string[]): P
         const fileNameClean = item.key.split('/').pop()?.replace('.md', '') || item.key;
         context += `\n--- Tema/Documento: ${fileNameClean} (Similitud: ${(item.similarity * 100).toFixed(1)}%) ---\n${fileContent}\n`;
         filesIncluded++;
+        includedKeys.push(item.key);
       }
     }
   }
 
-  // Si no hay suficientes con buena similitud semántica, caer a búsqueda por palabras clave
   if (filesIncluded === 0) {
     return getRelevantContextKeywordFallback(env, query, docKeys);
   }
 
-  // Generar embeddings en caliente para documentos sin embedding (solo los que tienen keywords coincidentes)
-  // pero en lotes pequeños para no exceder CPU
+  // Extraer imágenes de los documentos incluidos
+  const images: string[] = [];
+  for (const key of includedKeys) {
+    const content = await getFileContent(env, key);
+    if (content) {
+      images.push(...extractImages(content, key));
+    }
+  }
+
   if (missingEmbeds.length > 0) {
     const usedKeys = new Set(topDocs.map(d => d.key));
     const unusedMissing = missingEmbeds.filter(k => !usedKeys.has(k));
@@ -642,7 +681,7 @@ async function getRelevantContext(env: Env, query: string, docKeys: string[]): P
     }
   }
 
-  return context;
+  return { context, images };
 }
 
 /**
@@ -722,7 +761,7 @@ async function handleUserQuery(env: Env, chatId: number, query: string): Promise
   const allDocKeys: string[] = JSON.parse(fileListStr);
 
   // 2. Obtener contexto optimizado y filtrado
-  const kbContext = await getRelevantContext(env, query, allDocKeys);
+  const { context: kbContext, images: kbImages } = await getRelevantContext(env, query, allDocKeys);
 
   // 3. Prompt de sistema con las reglas de Aizprua S.E.
   const systemPrompt = `Eres el asistente virtual oficial de "Aizprua S.E." (Aizprua Servicios Especiales). Tu comportamiento debe ser sumamente profesional, respetuoso y formal.
@@ -776,6 +815,9 @@ ${kbContext}`;
       history.push({ role: "model", text: answer });
       await saveChatHistory(env, chatId, history);
       await sendTelegramMessagePlain(env, chatId, `${answer}\n\n- Gemini`);
+      for (const imgUrl of kbImages.slice(0, 5)) {
+        await sendTelegramPhoto(env, chatId, imgUrl);
+      }
       return;
     } catch (err: any) {
       const geminiErrMsg = err.message || err;
@@ -800,6 +842,9 @@ ${kbContext}`;
       history.push({ role: "model", text: orAnswer });
       await saveChatHistory(env, chatId, history);
       await sendTelegramMessagePlain(env, chatId, `${orAnswer}\n\n- OpenRouter (Nemotron)`);
+      for (const imgUrl of kbImages.slice(0, 5)) {
+        await sendTelegramPhoto(env, chatId, imgUrl);
+      }
       return;
     } catch (fallbackErr: any) {
       console.error("Fallo en OpenRouter:", fallbackErr.message || fallbackErr);
@@ -815,6 +860,9 @@ ${kbContext}`;
       history.push({ role: "model", text: cfAnswer });
       await saveChatHistory(env, chatId, history);
       await sendTelegramMessagePlain(env, chatId, `${cfAnswer}\n\n- Cloudflare AI (Llama)`);
+      for (const imgUrl of kbImages.slice(0, 5)) {
+        await sendTelegramPhoto(env, chatId, imgUrl);
+      }
       return;
     } catch (lastErr: any) {
       const lastErrMsg = lastErr.message || lastErr;
@@ -1266,7 +1314,7 @@ function cosineSimilarity(vecA: number[], vecB: number[]): number {
  * Búsqueda clásica por palabras clave (fallback cuando no hay embeddings cacheados o suficientes coincidencias).
  * Optimizada para no descargar contenido de todos los archivos — primero filtra por nombre.
  */
-async function getRelevantContextKeywordFallback(env: Env, query: string, docKeys: string[]): Promise<string> {
+async function getRelevantContextKeywordFallback(env: Env, query: string, docKeys: string[]): Promise<{ context: string; images: string[] }> {
   const stopWords = new Set(["el", "la", "los", "las", "un", "una", "unos", "unas", "de", "del", "y", "o", "e", "u", "a", "en", "para", "por", "con", "sin", "sobre", "que", "es", "son", "se", "lo", "como", "cual", "cuales", "donde", "cuando", "quien", "cuanto", "cuantos"]);
 
   const keywords = query.toLowerCase()
@@ -1274,12 +1322,10 @@ async function getRelevantContextKeywordFallback(env: Env, query: string, docKey
     .split(/\s+/)
     .filter(word => word.length > 2 && !stopWords.has(word));
 
-  // Fase 1: filtrar por nombre de archivo (sin descargar contenido)
   const nameMatched = docKeys.filter(key =>
     key.endsWith("index.md") || keywords.some(kw => key.toLowerCase().includes(kw))
   );
 
-  // Fase 2: descargar contenido solo de los archivos que coinciden por nombre (en paralelo)
   let matchedDocs: { key: string; content: string }[] = [];
   if (nameMatched.length > 0) {
     const results = await Promise.all(nameMatched.map(async (key) => {
@@ -1289,7 +1335,6 @@ async function getRelevantContextKeywordFallback(env: Env, query: string, docKey
     matchedDocs = results.filter(r => r.content);
   }
 
-  // Fase 3: verificar también coincidencias en el contenido
   const contentMatched = matchedDocs.filter(({ key, content }) => {
     if (key.endsWith("index.md")) return true;
     const fileNameLower = key.toLowerCase();
@@ -1298,27 +1343,37 @@ async function getRelevantContextKeywordFallback(env: Env, query: string, docKey
   });
 
   let context = "";
+  let includedKeys: string[] = [];
+
   if (contentMatched.length > 1) {
     for (const { key, content } of contentMatched) {
       const fileNameClean = key.split('/').pop()?.replace('.md', '') || key;
       context += `\n--- Tema/Documento: ${fileNameClean} ---\n${content}\n`;
+      includedKeys.push(key);
     }
-    return context;
+  } else {
+    const limit = Math.min(docKeys.length, 8);
+    const defaultDocs = await Promise.all(docKeys.slice(0, limit).map(async (key) => {
+      const content = await getFileContent(env, key);
+      return { key, content: content || "" };
+    }));
+
+    for (const { key, content } of defaultDocs) {
+      if (content) {
+        const fileNameClean = key.split('/').pop()?.replace('.md', '') || key;
+        context += `\n--- Tema/Documento: ${fileNameClean} ---\n${content}\n`;
+        includedKeys.push(key);
+      }
+    }
   }
 
-  // Fase 4: si no hay suficientes coincidencias, incluir los primeros 8 docs en paralelo
-  const limit = Math.min(docKeys.length, 8);
-  const defaultDocs = await Promise.all(docKeys.slice(0, limit).map(async (key) => {
+  const images: string[] = [];
+  for (const key of includedKeys) {
     const content = await getFileContent(env, key);
-    return { key, content: content || "" };
-  }));
-
-  for (const { key, content } of defaultDocs) {
     if (content) {
-      const fileNameClean = key.split('/').pop()?.replace('.md', '') || key;
-      context += `\n--- Tema/Documento: ${fileNameClean} ---\n${content}\n`;
+      images.push(...extractImages(content, key));
     }
   }
 
-  return context;
+  return { context, images };
 }
