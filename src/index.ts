@@ -489,7 +489,7 @@ async function getFileContent(env: Env, path: string): Promise<string | null> {
  * Sincroniza la lista de archivos .md desde GitHub usando Git Trees API (1 sola llamada).
  * No descarga contenidos ni genera embeddings — eso se hace bajo demanda en las consultas.
  */
-async function syncGitHubWiki(env: Env, chatId: number): Promise<void> {
+async function syncGitHubWiki(env: Env, chatId: number, isAutomatic = false): Promise<void> {
   // 1. Obtener SHA de la branch main
   const refRes = await fetch("https://api.github.com/repos/arubel86/Aizpruase-Documentos-Tramites/git/refs/heads/main", {
     headers: {
@@ -569,29 +569,42 @@ async function syncGitHubWiki(env: Env, chatId: number): Promise<void> {
     cursor = listEmbeds.list_complete ? undefined : listEmbeds.cursor;
   } while (cursor);
 
-  // Generar embeddings de forma proactiva para los primeros 10 documentos en segundo plano para evitar latencia inicial, con try-catch individual (Mejora F)
+  // Generar embeddings de forma proactiva para los primeros 5 documentos en paralelo para evitar latencia y timeouts (Mejora F + Optimización)
   let generatedCount = 0;
-  const initialBatch = filesList.slice(0, 10);
-  for (const key of initialBatch) {
+  const initialBatch = filesList.slice(0, 5);
+  
+  const embeddingPromises = initialBatch.map(async (key) => {
     try {
       const content = await getFileContent(env, key);
       if (content) {
         const embedding = await generateEmbedding(env, content);
         if (embedding) {
           await env.AIZPRUA_WIKI_KV.put(`embedding:${key}`, JSON.stringify(embedding));
-          generatedCount++;
+          return true;
         }
       }
     } catch (err) {
       console.error(`Error al pre-generar embedding para ${key}:`, err);
     }
-  }
+    return false;
+  });
 
-  await sendTelegramMessage(
-    env,
-    chatId,
-    `✅ *Sincronización completada* 📚\n━━━━━━━━━━━━━━━━━━━━━━\n📄 Archivos .md encontrados: ${filesList.length}\n✅ Embeddings regenerados: ${generatedCount} / ${initialBatch.length} (lote inicial)\n📋 Lista guardada en KV\n━━━━━━━━━━━━━━━━━━━━━━\nLos contenidos restantes se procesan bajo demanda.`
-  );
+  const results = await Promise.all(embeddingPromises);
+  generatedCount = results.filter(Boolean).length;
+
+  if (isAutomatic) {
+    await sendTelegramMessage(
+      env,
+      chatId,
+      `✅ *Sincronización automática completada con éxito* 📚\n━━━━━━━━━━━━━━━━━━━━━━\n📄 Archivos .md totales: ${filesList.length}\n⚡ Base de conocimiento actualizada correctamente.`
+    );
+  } else {
+    await sendTelegramMessage(
+      env,
+      chatId,
+      `✅ *Sincronización completada* 📚\n━━━━━━━━━━━━━━━━━━━━━━\n📄 Archivos .md encontrados: ${filesList.length}\n✅ Embeddings regenerados: ${generatedCount} / ${initialBatch.length} (lote inicial)\n📋 Lista guardada en KV\n━━━━━━━━━━━━━━━━━━━━━━\nLos contenidos restantes se procesan bajo demanda.`
+    );
+  }
 }
 
 /**
@@ -655,18 +668,42 @@ async function handleGitHubWebhookRequest(request: Request, env: Env, ctx: Execu
 async function processGitHubPush(env: Env, payload: any): Promise<void> {
   const repoFullName = payload.repository?.full_name || "desconocido";
   const pusherName = payload.pusher?.name || "desconocido";
-  const commitCount = payload.commits?.length || 0;
+  
+  // Contar los documentos markdown (.md) que cambiaron en este push
+  const affectedDocs = new Set<string>();
+  if (payload.commits && Array.isArray(payload.commits)) {
+    for (const commit of payload.commits) {
+      const files = [
+        ...(commit.added || []),
+        ...(commit.removed || []),
+        ...(commit.modified || [])
+      ];
+      for (const f of files) {
+        if (f.endsWith(".md")) {
+          affectedDocs.add(f);
+        }
+      }
+    }
+  }
+  const documentCount = affectedDocs.size;
 
-  console.log(`GitHub push: ${commitCount} commits en ${repoFullName} por ${pusherName}`);
+  console.log(`GitHub push: ${payload.commits?.length || 0} commits en ${repoFullName} por ${pusherName}. Documentos .md afectados: ${documentCount}`);
+
+  let startMsg = `🔄 *Sincronización automática iniciada*\n\n`;
+  if (documentCount > 0) {
+    startMsg += `Se detectaron ${documentCount} documento(s) con cambios y se está actualizando la base de conocimiento... ⏳`;
+  } else {
+    startMsg += `Se detectaron cambios en el repositorio y se está actualizando la base de conocimiento... ⏳`;
+  }
 
   await sendTelegramMessage(
     env,
     parseInt(env.ADMIN_TELEGRAM_ID),
-    `🔄 *Sincronización automática iniciada*\n\nSe detectaron ${commitCount} nuevo(s) commit(s) en \`${repoFullName}\` por *${pusherName}*.\n\nActualizando base de conocimiento... ⏳`
+    startMsg
   );
 
   try {
-    await syncGitHubWiki(env, parseInt(env.ADMIN_TELEGRAM_ID));
+    await syncGitHubWiki(env, parseInt(env.ADMIN_TELEGRAM_ID), true);
   } catch (err: any) {
     const errMsg = err.message || err;
     console.error("Error en sincronización automática por webhook:", errMsg);
