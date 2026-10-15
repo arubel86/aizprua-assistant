@@ -377,23 +377,90 @@ async function sendTelegramMessagePlain(env: Env, chatId: number, text: string):
 }
 
 /**
- * Envía una foto a Telegram desde una URL.
+ * Envía una foto a Telegram descargando el binario desde GitHub (repo privado) y subiéndolo
+ * directamente vía multipart/form-data. Si falla, envía un enlace clicable como respaldo.
+ *
+ * Explicación Racional: El repo es privado, por lo que Telegram no puede acceder a las URLs
+ * de raw.githubusercontent.com. La solución es descargar la imagen con el GITHUB_TOKEN del bot
+ * y subir el binario directamente a la API de Telegram.
  */
 async function sendTelegramPhoto(env: Env, chatId: number, photoUrl: string): Promise<void> {
-  const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendPhoto`;
   try {
+    // 1. Descargar imagen desde GitHub con autenticación
+    const imgRes = await fetch(photoUrl, {
+      headers: {
+        "Authorization": `token ${env.GITHUB_TOKEN}`,
+        "User-Agent": "Cloudflare-Worker-Telegram-Bot"
+      }
+    });
+
+    if (!imgRes.ok) {
+      console.error(`No se pudo descargar imagen ${photoUrl}: Status ${imgRes.status}`);
+      await sendImageFallbackLink(env, chatId, photoUrl);
+      return;
+    }
+
+    const imgBuffer = await imgRes.arrayBuffer();
+    const contentType = imgRes.headers.get("content-type") || "image/png";
+    const ext = contentType.includes("jpeg") || contentType.includes("jpg") ? "jpg"
+              : contentType.includes("gif") ? "gif"
+              : contentType.includes("webp") ? "webp"
+              : "png";
+    const fileName = `image.${ext}`;
+
+    // 2. Construir multipart/form-data manualmente (compatible con Cloudflare Workers)
+    const boundary = "----TelegramBotBoundary" + Date.now();
+    const parts: Uint8Array[] = [];
+    const enc = new TextEncoder();
+
+    // Campo: chat_id
+    parts.push(enc.encode(`--${boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n${chatId}\r\n`));
+
+    // Campo: photo (binario de la imagen)
+    parts.push(enc.encode(`--${boundary}\r\nContent-Disposition: form-data; name="photo"; filename="${fileName}"\r\nContent-Type: ${contentType}\r\n\r\n`));
+    parts.push(new Uint8Array(imgBuffer));
+    parts.push(enc.encode(`\r\n--${boundary}--\r\n`));
+
+    // Concatenar todas las partes en un único buffer
+    let totalLength = 0;
+    for (const p of parts) totalLength += p.length;
+    const body = new Uint8Array(totalLength);
+    let offset = 0;
+    for (const p of parts) { body.set(p, offset); offset += p.length; }
+
+    // 3. Enviar a Telegram como upload binario directo
+    const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendPhoto`;
     const res = await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, photo: photoUrl })
+      headers: { "Content-Type": `multipart/form-data; boundary=${boundary}` },
+      body: body
     });
+
     if (!res.ok) {
       const errText = await res.text();
-      console.error(`Error enviando foto ${photoUrl}: ${errText}`);
+      console.error(`Error enviando foto binaria a Telegram: ${errText}`);
+      await sendImageFallbackLink(env, chatId, photoUrl);
     }
   } catch (err) {
-    console.error(`Error al enviar foto ${photoUrl}:`, err);
+    console.error(`Error al procesar foto ${photoUrl}:`, err);
+    await sendImageFallbackLink(env, chatId, photoUrl);
   }
+}
+
+/**
+ * Envía un enlace clicable al archivo en GitHub como respaldo si el envío binario de imagen falla.
+ * Convierte la URL raw a la URL web de GitHub (blob view) para que el usuario pueda abrirla.
+ */
+async function sendImageFallbackLink(env: Env, chatId: number, rawUrl: string): Promise<void> {
+  const webUrl = rawUrl
+    .replace("https://raw.githubusercontent.com/", "https://github.com/")
+    .replace("/main/", "/blob/main/");
+
+  const fileName = decodeURIComponent(rawUrl.split("/").pop() || "imagen");
+  await sendTelegramMessagePlain(
+    env, chatId,
+    `Imagen adjunta: ${fileName}\nVer imagen: ${webUrl}`
+  );
 }
 
 const GITHUB_RAW_BASE = "https://raw.githubusercontent.com/arubel86/Aizpruase-Documentos-Tramites/main";
@@ -545,64 +612,90 @@ async function syncGitHubWiki(env: Env, chatId: number, isAutomatic = false): Pr
     filesList.push(item.path);
   }
 
-  // 4. Guardar la lista de archivos en KV, limpiando antes los contenidos cacheados de la lista anterior (Mejora D)
+  // Explicación Racional: Al sincronizar, debemos invalidar la caché de contenido de los archivos
+  // y sus embeddings anteriores para obligar al sistema a descargar la versión más reciente de GitHub
+  // y calcular vectores basados en los nuevos precios. Lo hacemos en lotes paralelos de 15 para velocidad y eficiencia.
   const oldFileListStr = await env.AIZPRUA_WIKI_KV.get("_file_list");
   if (oldFileListStr) {
     try {
       const oldFileList = JSON.parse(oldFileListStr) as string[];
-      for (const oldFile of oldFileList) {
-        await env.AIZPRUA_WIKI_KV.delete(oldFile);
+      const deleteBatchSize = 15;
+      for (let i = 0; i < oldFileList.length; i += deleteBatchSize) {
+        const batch = oldFileList.slice(i, i + deleteBatchSize);
+        await Promise.all(batch.map(async (oldFile) => {
+          await env.AIZPRUA_WIKI_KV.delete(oldFile);
+          await env.AIZPRUA_WIKI_KV.delete(`embedding:${oldFile}`);
+        }));
       }
     } catch (e) {
-      console.error("Error al limpiar archivos cacheados viejos:", e);
+      console.error("Error al limpiar archivos y embeddings cacheados viejos:", e);
     }
   }
   await env.AIZPRUA_WIKI_KV.put("_file_list", JSON.stringify(filesList));
 
-  // Limpiar embeddings antiguos del modelo en inglés con paginación (Mejora G)
-  let cursor: string | undefined = undefined;
-  do {
-    const listEmbeds: any = await env.AIZPRUA_WIKI_KV.list({ prefix: "embedding:", cursor });
-    for (const key of listEmbeds.keys) {
-      await env.AIZPRUA_WIKI_KV.delete(key.name);
-    }
-    cursor = listEmbeds.list_complete ? undefined : listEmbeds.cursor;
-  } while (cursor);
-
-  // Generar embeddings de forma proactiva para los primeros 5 documentos en paralelo para evitar latencia y timeouts (Mejora F + Optimización)
+  // Explicación Racional: Generamos embeddings de forma proactiva para los archivos en lotes.
+  // Cualquier embedding restante se generará automáticamente al vuelo con la versión fresca de GitHub.
   let generatedCount = 0;
-  const initialBatch = filesList.slice(0, 5);
-  
-  const embeddingPromises = initialBatch.map(async (key) => {
-    try {
-      const content = await getFileContent(env, key);
-      if (content) {
-        const embedding = await generateEmbedding(env, content);
-        if (embedding) {
-          await env.AIZPRUA_WIKI_KV.put(`embedding:${key}`, JSON.stringify(embedding));
-          return true;
-        }
-      }
-    } catch (err) {
-      console.error(`Error al pre-generar embedding para ${key}:`, err);
-    }
-    return false;
-  });
+  let skippedCount = 0;
+  const batchSize = 10;
+  const maxGenerationsPerSync = 15;
 
-  const results = await Promise.all(embeddingPromises);
-  generatedCount = results.filter(Boolean).length;
+  for (let i = 0; i < filesList.length; i += batchSize) {
+    const batch = filesList.slice(i, i + batchSize);
+    
+    // Verificar en paralelo si ya existe el embedding en KV
+    const checkResults = await Promise.all(batch.map(async (key) => {
+      try {
+        const exists = await env.AIZPRUA_WIKI_KV.get(`embedding:${key}`);
+        return { key, exists: !!exists };
+      } catch {
+        return { key, exists: false };
+      }
+    }));
+
+    const missingKeys = checkResults.filter(r => !r.exists).map(r => r.key);
+    skippedCount += (batch.length - missingKeys.length);
+
+    if (missingKeys.length > 0) {
+      // Si ya alcanzamos el límite seguro para esta ejecución, saltamos el procesamiento de más embeddings
+      if (generatedCount >= maxGenerationsPerSync) {
+        continue;
+      }
+
+      const keysToProcess = missingKeys.slice(0, maxGenerationsPerSync - generatedCount);
+      const embeddingPromises = keysToProcess.map(async (key) => {
+        try {
+          const content = await getFileContent(env, key);
+          if (content) {
+            const embedding = await generateEmbedding(env, content);
+            if (embedding) {
+              await env.AIZPRUA_WIKI_KV.put(`embedding:${key}`, JSON.stringify(embedding));
+              return true;
+            }
+          }
+        } catch (err) {
+          console.error(`Error al pre-generar embedding para ${key}:`, err);
+        }
+        return false;
+      });
+
+      const results = await Promise.all(embeddingPromises);
+      generatedCount += results.filter(Boolean).length;
+    }
+  }
 
   if (isAutomatic) {
     await sendTelegramMessage(
       env,
       chatId,
-      `✅ *Sincronización automática completada con éxito* 📚\n━━━━━━━━━━━━━━━━━━━━━━\n📄 Archivos .md totales: ${filesList.length}\n⚡ Base de conocimiento actualizada correctamente.`
+      `✅ *Sincronización automática completada* 📚\n━━━━━━━━━━━━━━━━━━━━━━\n📄 Archivos .md totales: ${filesList.length}\n⚡ Base de conocimiento sincronizada.`
     );
   } else {
+    const totalIndexados = skippedCount + generatedCount;
     await sendTelegramMessage(
       env,
       chatId,
-      `✅ *Sincronización completada* 📚\n━━━━━━━━━━━━━━━━━━━━━━\n📄 Archivos .md encontrados: ${filesList.length}\n✅ Embeddings regenerados: ${generatedCount} / ${initialBatch.length} (lote inicial)\n📋 Lista guardada en KV\n━━━━━━━━━━━━━━━━━━━━━━\nLos contenidos restantes se procesan bajo demanda.`
+      `✅ *Sincronización completada* 📚\n━━━━━━━━━━━━━━━━━━━━━━\n📄 Archivos .md encontrados: ${filesList.length}\n💾 Embeddings existentes: ${skippedCount}\n⚡ Embeddings nuevos indexados: ${generatedCount}\n📊 Total embeddings listos: ${totalIndexados} / ${filesList.length}\n━━━━━━━━━━━━━━━━━━━━━━\nLos archivos restantes se indexarán al vuelo de forma transparente al ser consultados.`
     );
   }
 }
@@ -750,6 +843,35 @@ async function getRelevantContext(env: Env, query: string, docKeys: string[]): P
     }
   }));
 
+  // Explicación Racional: Si hay archivos en la wiki que no tienen embedding en KV,
+  // en lugar de ignorarlos y perder precisión en la respuesta actual, generamos
+  // sus embeddings al vuelo de forma concurrente en lotes de 10.
+  const keysToEmbed = embResults.filter(r => !r.embStr).map(r => r.key);
+  if (keysToEmbed.length > 0) {
+    console.log(`Generando ${keysToEmbed.length} embeddings faltantes al vuelo...`);
+    const batchSize = 10;
+    for (let i = 0; i < keysToEmbed.length; i += batchSize) {
+      const batch = keysToEmbed.slice(i, i + batchSize);
+      await Promise.all(batch.map(async (key) => {
+        try {
+          const content = await getFileContent(env, key);
+          if (content) {
+            const embedding = await generateEmbedding(env, content);
+            if (embedding) {
+              await env.AIZPRUA_WIKI_KV.put(`embedding:${key}`, JSON.stringify(embedding));
+              const index = embResults.findIndex(r => r.key === key);
+              if (index !== -1) {
+                embResults[index].embStr = JSON.stringify(embedding);
+              }
+            }
+          }
+        } catch (err) {
+          console.error(`Error generando embedding al vuelo para ${key}:`, err);
+        }
+      }));
+    }
+  }
+
   for (const { key, embStr } of embResults) {
     if (embStr) {
       try {
@@ -794,27 +916,6 @@ async function getRelevantContext(env: Env, query: string, docKeys: string[]): P
   const images: string[] = [];
   for (const doc of includedDocs) {
     images.push(...extractImages(doc.content, doc.key));
-  }
-
-  if (missingEmbeds.length > 0) {
-    const usedKeys = new Set(topDocs.map(d => d.key));
-    const unusedMissing = missingEmbeds.filter(k => !usedKeys.has(k));
-    if (unusedMissing.length > 0) {
-      try {
-        const batch = unusedMissing.slice(0, 5);
-        for (const key of batch) {
-          const content = await getFileContent(env, key);
-          if (content) {
-            const embedding = await generateEmbedding(env, content);
-            if (embedding) {
-              await env.AIZPRUA_WIKI_KV.put(`embedding:${key}`, JSON.stringify(embedding));
-            }
-          }
-        }
-      } catch (err) {
-        console.error("Error al generar embeddings post-respuesta:", err);
-      }
-    }
   }
 
   // Explicación Racional: El modelo bge-m3 produce similitudes altas para muchos documentos,
@@ -905,7 +1006,13 @@ function findMatchingDocs(citedText: string, allDocKeys: string[]): string[] {
   
   const matches: string[] = [];
   for (const doc of cleanDocs) {
-    if (normalizedCited.includes(doc.normalized) || doc.normalized.includes(normalizedCited)) {
+    // Explicación Racional: Se requiere un mínimo de 5 caracteres para el matching por subcadena.
+    // Sin esta restricción, nombres cortos como "log" coinciden falsamente dentro de palabras
+    // más largas como "catalogo" (cata-LOG-o), generando fuentes incorrectas en el pie de página.
+    const minLen = 5;
+    const citedContainsDoc = doc.normalized.length >= minLen && normalizedCited.includes(doc.normalized);
+    const docContainsCited = normalizedCited.length >= minLen && doc.normalized.includes(normalizedCited);
+    if (citedContainsDoc || docContainsCited) {
       matches.push(doc.original);
     }
   }
@@ -1082,7 +1189,8 @@ ${kbContext}`;
       await saveChatHistory(env, chatId, history);
       const footerText = formatTelegramFooter(finalFuentes, "Gemini");
       await sendTelegramMessagePlain(env, chatId, `${cleanAnswer}${footerText}`);
-      for (const imgUrl of kbImages.slice(0, 5)) {
+      const filteredImages = filterImagesByQuery(kbImages, query);
+      for (const imgUrl of filteredImages) {
         await sendTelegramPhoto(env, chatId, imgUrl);
       }
       return;
@@ -1113,7 +1221,8 @@ ${kbContext}`;
       await saveChatHistory(env, chatId, history);
       const footerText = formatTelegramFooter(finalOrFuentes, "OpenRouter (Nemotron)");
       await sendTelegramMessagePlain(env, chatId, `${cleanOrAnswer}${footerText}`);
-      for (const imgUrl of kbImages.slice(0, 5)) {
+      const filteredOrImages = filterImagesByQuery(kbImages, query);
+      for (const imgUrl of filteredOrImages) {
         await sendTelegramPhoto(env, chatId, imgUrl);
       }
       return;
@@ -1135,7 +1244,8 @@ ${kbContext}`;
       await saveChatHistory(env, chatId, history);
       const footerText = formatTelegramFooter(finalCfFuentes, "Cloudflare AI (Llama)");
       await sendTelegramMessagePlain(env, chatId, `${cleanCfAnswer}${footerText}`);
-      for (const imgUrl of kbImages.slice(0, 5)) {
+      const filteredCfImages = filterImagesByQuery(kbImages, query);
+      for (const imgUrl of filteredCfImages) {
         await sendTelegramPhoto(env, chatId, imgUrl);
       }
       return;
@@ -1288,7 +1398,7 @@ async function callCloudflareAI(env: Env, systemPrompt: string, history: {role: 
     })
   ];
 
-  const res = await env.AI.run("@cf/meta/llama-3.1-8b-instruct", {
+  const res = await env.AI.run("@cf/meta/llama-3.2-3b-instruct", {
     messages,
     max_tokens: 1200,
     temperature: 0.1
@@ -1463,7 +1573,7 @@ async function runSystemDiagnostics(env: Env): Promise<string> {
   // 5. Validar Cloudflare AI (Llama) como último recurso
   let cfAIStatus = "✅ Respondiendo";
   try {
-    const cfRes = await env.AI.run("@cf/meta/llama-3.1-8b-instruct", {
+    const cfRes = await env.AI.run("@cf/meta/llama-3.2-3b-instruct", {
       messages: [{ role: "user", content: "Hi" }],
       max_tokens: 5
     }) as any;
@@ -1575,6 +1685,52 @@ function normalizeText(text: string): string {
     .toLowerCase()
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, ""); // Remueve tildes y diacríticos
+}
+
+/**
+ * Filtra las imágenes extraídas del documento para enviar solo las más relevantes a la consulta del usuario.
+ *
+ * Explicación Racional: Cuando un documento tiene múltiples imágenes (ej. un catálogo con 10 productos),
+ * usar un simple OR (cualquier keyword coincide) envía demasiadas imágenes. En su lugar, se usa un
+ * sistema de puntuación: cada imagen recibe un score basado en la longitud total de keywords que
+ * coinciden con su nombre de archivo. "xprinter" (8 chars) puntúa más que "mini" (4 chars),
+ * así que la imagen más específica gana. Solo se envían las imágenes con el puntaje más alto.
+ */
+function filterImagesByQuery(images: string[], query: string): string[] {
+  if (images.length <= 1) return images;
+
+  const stopWords = new Set(["el", "la", "los", "las", "un", "una", "de", "del", "y", "o", "a", "en", "para", "por", "con", "que", "es", "son", "se", "lo", "me", "mi", "como", "dame", "imagen", "foto", "fotos", "ver", "mostrar", "cual"]);
+
+  const keywords = normalizeText(query)
+    .replace(/[¿?¡!.,;:#()\-]/g, " ")
+    .split(/\s+/)
+    .filter(w => w.length > 1 && !stopWords.has(w));
+
+  if (keywords.length === 0) return [];
+
+  // Puntuar cada imagen por la longitud total de keywords que coinciden (más largo = más específico)
+  const scored = images.map(imgUrl => {
+    const fileName = normalizeText(decodeURIComponent(imgUrl.split("/").pop() || ""));
+    let score = 0;
+    for (const kw of keywords) {
+      if (fileName.includes(kw)) {
+        score += kw.length;
+      }
+    }
+    return { imgUrl, score };
+  });
+
+  // Filtrar solo imágenes con score > 0
+  const matched = scored.filter(s => s.score > 0);
+
+  if (matched.length === 0) return [];
+
+  // Ordenar por puntaje descendente y tomar solo las del mejor score
+  matched.sort((a, b) => b.score - a.score);
+  const bestScore = matched[0].score;
+  const best = matched.filter(s => s.score === bestScore);
+
+  return best.slice(0, 3).map(s => s.imgUrl);
 }
 
 /**
